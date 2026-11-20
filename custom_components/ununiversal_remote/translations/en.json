@@ -1,0 +1,29 @@
+{
+  "options": {
+    "step": {
+      "init": {
+        "title": "Bluetooth handheld",
+        "description": "Choose a discovered handheld or enter its Bluetooth address. You can use Bluetooth and MQTT independently.",
+        "data": {"ble_address": "Bluetooth address"}
+      }
+    },
+    "error": {
+      "invalid_address": "Enter a Bluetooth address such as AA:BB:CC:DD:EE:FF."
+    }
+  },
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up The Ununiversal Remote",
+        "description": "Optionally choose a switch for soft key A. Open Remote Menus after setup to edit the menu.",
+        "data": {"remote_id": "Remote ID", "switch_entity": "First switch (optional)"}
+      }
+    },
+    "error": {
+      "invalid_remote_id": "Use lowercase letters, digits, or underscores, starting with a letter (up to 32 characters)."
+    },
+    "abort": {
+      "already_configured": "The remote integration is already set up."
+    }
+  }
+}

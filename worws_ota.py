@@ -14,11 +14,13 @@ from zlib import crc32
 
 
 RECOVERY_NAME = "WoRws_D"
+SWITCHBOT_SERVICE_DATA = ("00000d00-0000-1000-8000-00805f9b34fb",
+                         "0000fd3d-0000-1000-8000-00805f9b34fb")
 SERVICE = "02f00000-0000-0000-0000-00000000fe00"
 SEND = "02f00000-0000-0000-0000-00000000ff01"
 RECEIVE = "02f00000-0000-0000-0000-00000000ff02"
 
-# Populate only after matching the app's v4.8 recovery package and transfer.
+# Populate after bench validation of the v4.8 package and transfer.
 # The value for each SHA-256 is the verified RES start address, or None for
 # a package without RES.bin.
 VERIFIED_V48_RECOVERY_PACKAGES: dict[str, int | None] = {}
@@ -66,7 +68,7 @@ def load_package(path):
 def recovery_address(digest, images):
     if digest not in VERIFIED_V48_RECOVERY_PACKAGES:
         raise OtaError(
-            "This SHA-256 has not been verified against the app-selected v4.8 recovery package"
+            "This package has no verified local v4.8 transfer profile"
         )
     address = VERIFIED_V48_RECOVERY_PACKAGES[digest]
     if "ARM.bin" not in images or ("RES.bin" in images) != (address is not None):
@@ -186,13 +188,23 @@ async def transfer_component(link, name, data, res_address, report):
         check_reply(reply, operation)
 
 
-async def recovery_devices(scan_seconds):
+def is_normal_remote(adv):
+    for service in SWITCHBOT_SERVICE_DATA:
+        data = adv.service_data.get(service, b"")
+        # WoRwsParser uses 7 and 39 for pairing and normal advertisements.
+        if len(data) >= 3 and (data[0] & 0x7F) in (7, 39):
+            return True
+    return False
+
+
+async def scan_devices(scan_seconds, normal=False):
     from bleak import BleakScanner
 
     found = {}
 
     def detect(device, adv):
-        if adv.local_name == RECOVERY_NAME:
+        matches = is_normal_remote(adv) if normal else adv.local_name == RECOVERY_NAME
+        if matches:
             found[device.address.lower()] = (device, adv)
 
     try:
@@ -213,7 +225,7 @@ def select_device(candidates, address):
 async def flash(address, images, res_address, scan_seconds, report):
     from bleak import BleakClient
 
-    device = select_device(await recovery_devices(scan_seconds), address)
+    device = select_device(await scan_devices(scan_seconds), address)
 
     def disconnected(_client):
         if link is not None:
@@ -244,12 +256,12 @@ def run_bluetooth(operation, *args):
 def confirm_version():
     print("Transfer ended and the remote disconnected for reboot.")
     if not sys.stdin.isatty():
-        print("Version verification pending. Check that the remote boots and SwitchBot reports v4.8.")
+        print("Version verification pending. Confirm v4.8 using a local firmware readback.")
         return 2
-    version = input("After the remote boots, enter its version as shown in the SwitchBot app: ")
+    version = input("After the remote boots, enter the version from local firmware readback: ")
     if version.strip().lower().removeprefix("v") != "4.8":
         raise OtaError("Firmware v4.8 was not confirmed after transfer")
-    print("Stock firmware v4.8 verified in the SwitchBot app.")
+    print("Stock firmware v4.8 confirmed by the operator.")
     return 0
 
 
@@ -258,8 +270,9 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     inspect = commands.add_parser("inspect", help="validate an OTA ZIP offline")
     inspect.add_argument("package", type=Path)
-    scan = commands.add_parser("scan", help="list remotes advertising recovery mode")
+    scan = commands.add_parser("scan", help="list Universal Remote BLE advertisements")
     scan.add_argument("--seconds", type=float, default=8)
+    scan.add_argument("--normal", action="store_true", help="list remotes in normal mode")
     upload = commands.add_parser("flash", help="send a verified v4.8 recovery ZIP")
     upload.add_argument("package", type=Path)
     upload.add_argument("--device", required=True, type=UUID, help="UUID printed by scan")
@@ -269,11 +282,12 @@ def main(argv=None):
         if args.command == "scan":
             if not math.isfinite(args.seconds) or args.seconds <= 0:
                 raise OtaError("Scan duration must be a positive number of seconds")
-            found = run_bluetooth(recovery_devices, args.seconds)
+            found = run_bluetooth(scan_devices, args.seconds, args.normal)
+            name = "Universal Remote (normal mode)" if args.normal else RECOVERY_NAME
             for address, (_, adv) in sorted(found.items()):
-                print(f"{address}  {adv.local_name}  {adv.rssi} dBm")
+                print(f"{address}  {name}  {adv.rssi} dBm")
             if not found:
-                print(f"No devices advertising {RECOVERY_NAME}.")
+                print(f"No devices found for {name}.")
             return 0
         digest, images = load_package(args.package)
         if args.command == "inspect":

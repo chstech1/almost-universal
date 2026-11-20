@@ -74,6 +74,17 @@ class PackageTests(unittest.TestCase):
         with self.assertRaises(ota.OtaError):
             ota.select_device(candidates, "unrelated-id")
 
+    def test_identifies_normal_remote_from_switchbot_service_data(self):
+        for service in ota.SWITCHBOT_SERVICE_DATA:
+            for code in (0x07, 0x27, 0xA7):
+                self.assertTrue(ota.is_normal_remote(
+                    SimpleNamespace(service_data={service: bytes((code, 0x20, 90))})
+                ))
+            self.assertFalse(ota.is_normal_remote(
+                SimpleNamespace(service_data={service: bytes((0x66, 0x20, 90))})
+            ))
+        self.assertFalse(ota.is_normal_remote(SimpleNamespace(service_data={"other": b"\x27\x20Z"})))
+
     def test_unconfirmed_version_does_not_report_success(self):
         with (
             patch("sys.stdin"),

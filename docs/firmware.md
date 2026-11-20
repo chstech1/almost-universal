@@ -1,6 +1,6 @@
 # Firmware research
 
-The spare runs v4.6. The static analysis used stock v4.8 and compared its images with v4.6 and v4.7. The Android update flow was studied in SwitchBot 9.11.15.13 (build 40000051).
+The V06 spare started on v4.6. After the [U6 capture](hardware-and-dumping.md#completed-v46-capture), the bench used v4.8 for the Bluetooth and display tests. The Android update flow was studied in SwitchBot 9.11.15.13 (build 40000051).
 
 ## Stock reference images
 
@@ -12,7 +12,9 @@ Eleven public OTA ZIPs (`09`, `10`, `11`, `12`, `20`, `27`, `40`, `42`, `46`, `4
 | `DSP.bin` | 456,819 bytes | Xtensa image with LVGL display and input code, LittleFS, and key maps and scene storage. v4.6 and v4.8 differ by one byte in a DSP version routine. |
 | `RES.bin` | 4,955,264 bytes | Contains resources and an executable Xtensa prefix. Identical across the examined v4.6, v4.7, and v4.8 packages. |
 
-The [Ghidra script](../tools/DecompileRemote.java) exports a function index and provisional pseudocode for a stock member imported as a raw binary. Provide a writable output directory as its first script argument. The ARM project used file offsets from base zero. DSP and RES-prefix analysis used inferred virtual bases `0x20000000` and `0x20100000`. Physical flash offsets, LCD interface, and a usable FR5086D toolchain remain open.
+The [Ghidra script](../tools/DecompileRemote.java) exports a function index and provisional pseudocode for a stock member imported as a raw binary. Provide a writable output directory as its first script argument. The initial ARM analysis used file offsets from base zero. Later work identified the ARM application link address as `0x01003000`. DSP and RES-prefix analysis used virtual bases `0x20000000` and `0x20100000`. The U6 capture independently located both members at their physical offsets.
+
+The stock DSP initializes a 240 × 320 LVGL display and registers separate keypad and wheel inputs. The panel commands are consistent with the ST7789 family. The exact controller variant and board behavior still need bench confirmation.
 
 ## Bluetooth recovery uploader
 
@@ -23,18 +25,22 @@ The [Python CLI](../worws_ota.py) has three subcommands.
 | Command | Behavior |
 | --- | --- |
 | `inspect PACKAGE` | Validates the archive offline and prints the SHA-256, components, sizes, and FreqChip CRC values. |
-| `scan` | Uses Bleak on macOS to list nearby devices advertising `WoRws_D`. |
-| `flash PACKAGE --device UUID` | Prototype transfer with explicit device selection, per-command acknowledgment handling, and post-reboot version confirmation. The verified-package list is empty, so this command rejects every package before connecting. |
+| `scan` | Uses Bleak on macOS to list nearby devices advertising `WoRws_D`. Add `--normal` to discover remotes in normal operation. |
+| `flash PACKAGE --device UUID` | Development transfer command with explicit device selection and per-command acknowledgment handling. The published profile list is empty, so this command rejects packages before connecting. |
 
-The public v4.8 archive passed download integrity checks. The exact app-selected recovery ZIP and its resource parameters still need confirmation. [Offline tests](../test_worws_ota.py) cover archive validation, the pre-connection package check, simulated packet ordering, chunking, and transfer failures. A successful live milestone requires a stock transfer to the spare followed by normal boot, working screen and controls, and v4.8 confirmed in the SwitchBot app.
+The bench uploader restored stock v4.8 over Bluetooth using the local `RES.bin`, `DSP.bin`, and `ARM.bin`. After reboot, a direct Bluetooth read reported v4.8 and a Down press brought up the normal screen. The bench procedure used neither the SwitchBot app nor its servers. The public CLI still needs the bench-specific transfer and post-reboot checks integrated and tested as a release. [Offline tests](../test_worws_ota.py)
 
 ## First custom firmware experiment
 
-The [offline candidate builder](../tools/build_worws_ota_test.py) checks the stock v4.8 DSP digest, replaces its English `Charging` label with the equal-length string `OTA TEST`, then verifies the output ZIP. The archive contains only `DSP.bin`. A byte comparison confirmed that every byte outside the label matches the stock v4.8 DSP image. Bootloader acceptance, actual display behavior, and recovery after a custom install remain unverified.
+The [offline candidate builder](../tools/build_worws_ota_test.py) checks the stock v4.8 DSP digest, replaces its English `Charging` label with the equal-length string `OTA TEST`, then verifies the output ZIP. The archive contains only `DSP.bin`. A byte comparison confirmed that every byte outside the label matches the stock v4.8 DSP image.
 
 ```sh
 python tools/build_worws_ota_test.py /path/to/WoRWS_freq_app_V48.zip WoRWS-v4.8-DSP-OTA-TEST.CANDIDATE.zip
 python worws_ota.py inspect WoRWS-v4.8-DSP-OTA-TEST.CANDIDATE.zip
 ```
 
-The stock updater normally finishes with an ARM stage, and the SPI captures show data beyond the DSP payload within its last flash sector. Both observations need to be resolved before a DSP-only install. The bench sequence is to verify a complete read and restore path, confirm stock v4.8 recovery over Bluetooth, then evaluate the DSP experiment on the matching stock baseline.
+An initial test that sent the modified DSP and stock ARM rebooted with a blank display. A full stock restore brought the screen back. The next test sent the modified DSP together with stock RES and ARM, and the spare rebooted and displayed **OTA TEST** on the charging screen. The cause of the earlier blank screen remains open.
+
+## Replacement ARM prototype
+
+The [V06 ARM source](../firmware/v06/README.md) builds an original menu and BLE application linked against the FR5080 SDK. The Cortex-M3 emulator exercised the GATT service, menu activation, two fresh soft A presses, and disconnect behavior. Home Assistant host tests routed those C-generated presses to a simulated switch. This ARM image has yet to boot on a physical V06. The DSP experiment retained the stock ARM updater. Independent wired recovery still needs bench verification before replacing that updater.

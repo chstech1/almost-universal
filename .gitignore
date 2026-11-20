@@ -4,6 +4,9 @@ __pycache__/
 .pio/
 captures/
 *.bin
+*.elf
+v06-menu.map
+*.urm
 *.part
 *.zip
 *.jsonl

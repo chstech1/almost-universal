@@ -62,4 +62,16 @@ python tools/u6_esp32/capture.py dump --port "$PORT" --out captures/u6-read-1.bi
 
 Use [`live.py`](../tools/u6_esp32/live.py) to keep one connection open for diagnostics, 1 MiB sections, or 4 KiB-aligned address ranges. Run `python tools/u6_esp32/watch.py captures/u6-read-1.jsonl` from another terminal to follow the example capture without opening a second serial connection.
 
-On the v4.6 spare, a fresh ESP32 read matched the first 2,088,960 bytes of an earlier ESP32 capture. The same comparison against the earlier ESP8266 capture found differences. Some USB frames arrived with unrecognized headers. During the long ESP32 read, the host withheld acknowledgment until a valid retransmission arrived. The underlying serial-link fault is still open. A rollback backup requires two independent, byte-identical 16,777,216-byte reads and a verified restore path. Keep dumps and timelines local because they can contain provisioning and personal configuration.
+## Completed v4.6 capture
+
+The ESP32 captured all 4,096 blocks in order for a total of 16,777,216 bytes. The SHA-256 is `6ce13a79ffc94b01de0df29044c1529df08ff88969d37fe3cbacaa278c60964b`. The first 2,088,960 bytes match an earlier ESP32 capture. The earlier ESP8266 capture differed. During the full capture the host recovered from malformed USB frames by withholding acknowledgment until a valid retransmission arrived.
+
+| U6 physical offset | Verified contents |
+| --- | --- |
+| `0x000000` | Exact stock v4.6 `DSP.bin` |
+| `0x080000` | Exact stock v2.7 `DSP.bin`. A saved copy record identifies this as the source of a prior flash copy. |
+| `0x100000` | Exact stock v4.6 `RES.bin`, also identical in v4.7 and v4.8 |
+| `0x800000` through `0xFFEFFF` | LittleFS settings and configuration volume with 2,047 blocks of 4 KiB |
+| `0xFFF000` | Sector containing the flash copy record |
+
+The stock v4.6 `ARM.bin` had no exact contiguous match in U6. An independent full read and a U6 restore are still pending. Keep raw dumps and timelines local because they can contain provisioning and personal configuration.
