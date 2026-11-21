@@ -1,0 +1,165 @@
+--- a/firmware/dsp-v48-native-menu/build.py
++++ b/firmware/dsp-v48-native-menu/build.py
+@@ -26,6 +26,9 @@
+ STOCK_DSP_SHA = "72ff3017d07537e000925babafc5f27ed1b9c0e0fe9d52cdac819e1b677adb45"
+ COLOR_ZIP_SHA = "c48f06501cc8e3d317fe3c8ae56c580558b39e5b7c826fd59eb5dd16fc7a01ab"
+ COLOR_DSP_SHA = "f15dcc1866ef59610c81489211dff0ec58c646fe17e8fb05135f96afabe6093c"
++COMBINED_DSP_SHA = "3b303cc650d69f0016484c14742c06a7b1b31459ff9e34ca257b09dbe082ae2a"
++SPLASH_GATE, MENU_FALLBACK = 0x2B0EB, 0x2B14A
++SPLASH_GATE_BYTES = bytes.fromhex("56b805")
+ 
+ SLOTS = {
+     "retired_audio": (0x271A4, 0x27405),
+@@ -80,12 +83,12 @@
+         raise SystemExit(message)
+ 
+ 
+-def compile_c(prefix, work, name):
++def compile_c(prefix, work, name, *, bypass=False):
+     model = "-mlongcalls" if name == "smoke" else "-mno-longcalls"
+     run([f"{prefix}-gcc", "-c", "-fstack-usage", "-Os", "-std=c11", "-Wall", "-Wextra", "-Werror",
+          "-ffreestanding", "-fno-stack-protector", "-mabi=windowed", "-mtext-section-literals",
+          model, "-DHANDHELD", "-DHANDHELD_LAYOUT", "-DHANDHELD_POLISH", "-DHANDHELD_COLOR",
+-         "-I", work, "-o", f"{name}.o", HERE / f"{name}.c"], cwd=work, check=True)
++         *(["-DSPLASH_BYPASS"] if bypass else []), "-I", work, "-o", f"{name}.o", HERE / f"{name}.c"], cwd=work, check=True)
+ 
+ 
+ def link(prefix, work, sections=()):
+@@ -220,7 +223,15 @@
+     return candidate, symbols
+ 
+ 
+-def smoke(prefix, work, candidate, symbols):
++def bypass_gate(payload, offset):
++    """Replace the stock-linked conditional splash gate with a direct jump to its menu fallback."""
++    require(payload[offset:offset + 3] == SPLASH_GATE_BYTES,
++            "Unexpected instruction at the exact combined splash gate")
++    displacement = MENU_FALLBACK - SPLASH_GATE - 4
++    payload[offset:offset + 3] = (0x06 | (displacement << 6)).to_bytes(3, "little")
++
++
++def smoke(prefix, work, candidate, symbols, *, bypass=False):
+     def rebase(data):
+         return b"".join(pack("<I", address - BASE + SIM) for (address,) in
+                         ((unpack_from("<I", data, j)[0],) for j in range(0, len(data), 4)))
+@@ -259,7 +270,7 @@
+         (work / f"{name}.bin").write_bytes(data)
+     run([f"{prefix}-as", "--no-transform", "--defsym", "FACTORY_PROOF=1", "--defsym", "REPORT=1",
+          "--defsym", "TILES=1", "--defsym", "COLOR=1", "-o", "start.o", HERE / "smoke.S"], cwd=work, check=True)
+-    compile_c(prefix, work, "smoke")
++    compile_c(prefix, work, "smoke", bypass=bypass)
+     sections = [
+         ("vectors", 0), ("start", 0x400), ("registration_literal", KEY_CALLBACK),
+         ("registration", 0x31581), ("label_call", SET_TEXT_CALL - 7),
+@@ -281,12 +292,29 @@
+     for name in ("native_menu_create", "handheld_report", "splash_first_press", "factory_compact",
+                  "audio_notice", "fan_notice", "climate_render_value", "unpack_splash"):
+         require(test_symbols[name] - SIM == symbols[name] - BASE, f"Fixture changed address of {name}")
++    if bypass:
++        # Execute the exact branch bytes in the rebased original extension.
++        section = work / "fixture-extension.bin"
++        run([f"{prefix}-objcopy", "--dump-section", f".extension={section}", "menu.elf"],
++            cwd=work, check=True)
++        data = bytearray(section.read_bytes())
++        at = SPLASH_GATE - (FACTORY_ENTRY + 4)
++        bypass_gate(data, at)
++        require(data[at:at + 3] == candidate[SPLASH_GATE:SPLASH_GATE + 3],
++                "Fixture branch differs from the diagnostic candidate")
++        section.write_bytes(data)
++        run([f"{prefix}-objcopy", "--update-section", f".extension={section}", "menu.elf"],
++            cwd=work, check=True)
+     status = run(["qemu-system-xtensa", "-M", "sim", "-cpu", "de212", "-m", "16M", "-display", "none",
+                   "-monitor", "none", "-serial", "none", "-semihosting",
+                   "-device", "loader,file=menu.elf,cpu-num=0"], cwd=work, timeout=10)
+     require(not status.returncode, f"Xtensa fixture stopped at line modulo 256 = {status.returncode}")
+-    print("Xtensa fixture passed: exact indexed frame, splash lifetime and keys, factory/Audio/Fan and shell,"
+-          " stock flush, Activities/TV navigation and packets, and Climate labels")
++    if bypass:
++        print("Xtensa fixture passed: exact three-byte bypass, zero crop allocations, no splash timer,"
++              " factory/Audio/Fan and shell, stock flush, Activities/TV navigation and packets, and Climate labels")
++    else:
++        print("Xtensa fixture passed: exact indexed frame, splash lifetime and keys, factory/Audio/Fan and shell,"
++              " stock flush, Activities/TV navigation and packets, and Climate labels")
+ 
+ 
+ def load(path, zip_hash, dsp_hash, *, only_dsp=False):
+@@ -305,6 +333,8 @@
+     parser.add_argument("stock_v48", type=Path)
+     parser.add_argument("approved_png", type=Path)
+     parser.add_argument("--tool-prefix", default="xtensa-esp32-elf")
++    parser.add_argument("--splash-bypass-control", action="store_true",
++                        help="skip only the splash gate in the exact combined DSP")
+     parser.add_argument("--output", type=Path, help="optional new .OFFLINE.zip after successful QEMU")
+     args = parser.parse_args()
+     if args.output:
+@@ -318,7 +348,11 @@
+         candidate, symbols = build(prefix, work, stock, reference)
+         run([f"{prefix}-size", "-A", "handheld.o"], cwd=work, check=True)
+         print((work / "handheld.su").read_text(), flush=True)
+-        smoke(prefix, work, candidate, symbols)
++        if args.splash_bypass_control:
++            require(sha256(candidate).hexdigest() == COMBINED_DSP_SHA,
++                    "The splash bypass requires the exact combined DSP")
++            bypass_gate(candidate, SPLASH_GATE)
++        smoke(prefix, work, candidate, symbols, bypass=args.splash_bypass_control)
+     print(f"DSP.bin {len(candidate)} bytes, SHA-256 {sha256(candidate).hexdigest()}, "
+           f"FreqChip CRC {crc32(candidate, 0xffffffff):08x}")
+     if args.output:
+--- a/firmware/dsp-v48-native-menu/smoke.c
++++ b/firmware/dsp-v48-native-menu/smoke.c
+@@ -355,6 +355,7 @@
+     proof_timer.repeats = repeats;
+ }
+ 
++#ifndef SPLASH_BYPASS
+ static void timer_tick(uint32_t elapsed)
+ {
+     if (proof_timer.callback && elapsed >= proof_timer.period) {
+@@ -364,6 +365,8 @@
+             proof_timer.callback = NULL;
+     }
+ }
++
++#endif
+ 
+ void fixture_pad_left(void *object, int padding, unsigned selector)
+ {
+@@ -625,6 +628,7 @@
+ }
+ #endif
+ 
++#ifndef SPLASH_BYPASS
+ static int check_splash_pixels(void)
+ {
+     static const unsigned expected[3][4] = {{77,44,88,145}, {41,200,160,28}, {20,233,200,27}};
+@@ -673,6 +677,8 @@
+     }
+     return 0;
+ }
++
++#endif
+ 
+ static int check_retired_pages(void)
+ {
+@@ -762,6 +768,13 @@
+     reset_splash_fixture();
+     stock_registration(&stock_nodev);
+     stock_initial_label(&label, "LCD CHECK.");
++#ifdef SPLASH_BYPASS
++    CHECK(spec.count == MenuChildCount && initial_label_hidden);
++    CHECK(!allocated && !peak_allocated && !alloc_attempts && !proof_timer.callback &&
++          !timer_runs && !normalized && !sent && changes == 1);
++    stock_first_press(&group, 0x200);
++    CHECK(!alloc_attempts && !proof_timer.callback && !sent && changes == 1);
++#else
+     CHECK(spec.count == SplashChildCount && initial_label_hidden && layout_labels[0].hidden);
+     CHECK(allocated == 5744 && peak_allocated == 5744);
+     checked = check_splash_pixels();
+@@ -831,6 +844,7 @@
+     CHECK(!unpack_splash(probe, 3, valid, sizeof valid));
+     CHECK(unpack_splash(probe, sizeof probe, valid, sizeof valid) && probe[3] == 0x55);
+     changes = 1;
++#endif
+     struct layout_label *title = &layout_labels[0];
+     struct layout_label *mode = &layout_labels[1];
+     struct layout_label *feedback = &layout_labels[2];

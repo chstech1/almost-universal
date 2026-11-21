@@ -1,0 +1,1871 @@
+--- a/firmware/dsp-v48-native-menu/build.py
++++ b/firmware/dsp-v48-native-menu/build.py
+@@ -1,31 +1,45 @@
+-"""Build the local native Home/Controls test from the exact v4.8 display checkpoint."""
++"""QEMU-only v4.8 retirement and full-frame splash proof. Never opens hardware."""
+ 
+ import argparse
+-import re
+ from hashlib import sha256
+ from pathlib import Path
+ from struct import pack, pack_into, unpack_from
+ from subprocess import run
+ from tempfile import TemporaryDirectory
+-from zipfile import ZipFile
++from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
++from zlib import crc32
++
++from encode_full_splash import prepare
+ 
+ 
+ HERE = Path(__file__).resolve().parent
+ BASE = 0x20000000
+ SIM = 0x60000000
+-FACTORY_ENTRY = 0x2A884
+-FACTORY_END = 0x2C3DA
+-EXTENSION = FACTORY_ENTRY + 4
+-SET_TEXT_CALL = 0x3164F
++FACTORY_ENTRY, FACTORY_END = 0x2A884, 0x2C3DA
++SET_TEXT_CALL, FRESH_CALL, REPORT_CALL = 0x3164F, 0xFF35, 0x50F4
+ KEY_CALLBACK = 0x3145C
+-FRESH_CALL = 0xFF35
+-REPORT_CALL = 0x50F4
+-BSS_START = 0x1E700
+-MENU_FONT = 0x001CA068
+-COMPACT_FONT = 0x20060A70
+-BASELINE_SHA = "c48f06501cc8e3d317fe3c8ae56c580558b39e5b7c826fd59eb5dd16fc7a01ab"
+-DSP_SHA = "f15dcc1866ef59610c81489211dff0ec58c646fe17e8fb05135f96afabe6093c"
+-SPLASH_CALLS = {
++PAGE_TABLE = 0x647D8
++FACTORY_TABLE = 0x472C0
++DUMP_POINTER, SHELL_DEMO = 0x419C0, 0x40FC0
++RAM_COPY = 0x648E4
++STOCK_ARCHIVE_SHA = "dac9677e93d4190dccc25498971ad146fee4d8217b6f866138266c088e4ca44e"
++STOCK_DSP_SHA = "72ff3017d07537e000925babafc5f27ed1b9c0e0fe9d52cdac819e1b677adb45"
++COLOR_ZIP_SHA = "c48f06501cc8e3d317fe3c8ae56c580558b39e5b7c826fd59eb5dd16fc7a01ab"
++COLOR_DSP_SHA = "f15dcc1866ef59610c81489211dff0ec58c646fe17e8fb05135f96afabe6093c"
++
++SLOTS = {
++    "retired_audio": (0x271A4, 0x27405),
++    "retired_fan": (0x2CA24, 0x2CC85),
++    "retired_dump": (0x20E14, 0x20F4B),
++}
++RETIRED_PAGES = {
++    "audio_notice": (0x6486C, 0x47140, (0x271CB, 0x271CB, 0x271C2, 0x271F2, 0x271CB,
++                                      0x271CB, 0x271CB, 0x271CB, 0x271CD), 0x27188, 0x271A4),
++    "fan_notice": (0x64864, 0x47300, (0x2CA4B, 0x2CA4B, 0x2CA42, 0x2CA72, 0x2CA4B,
++                                    0x2CA4B, 0x2CA4B, 0x2CA4B, 0x2CA4D), 0x2CA08, 0x2CA24),
++}
++
++CALLS = {
+     "stock_image_create": 0x1C9F4,
+     "stock_image_set_source": 0x1CA30,
+     "stock_set_position": 0x10C08,
+@@ -33,18 +47,13 @@
+     "stock_clear_flag": 0x362B0,
+     "stock_timer_create": 0x3FBE0,
+     "stock_timer_repeat": 0x41898,
+-}
+-ACTION_CALLS = {"stock_normalize": 0x1FEF4, "stock_ipc_send": 0x5E04,
+-                "stock_active_page": 0x30168, "memset": 0x3FEB0}
+-RECLAIM_CALLS = {name: offset for name, offset in SPLASH_CALLS.items()
+-                 if name.startswith(("stock_image_", "stock_timer_"))}
+-TILE_CALLS = {
++    "stock_normalize": 0x1FEF4,
++    "stock_ipc_send": 0x5E04,
++    "stock_active_page": 0x30168,
++    "memset": 0x3FEB0,
+     "stock_pad_left": 0x3A128,
+     "stock_label_create": 0x1D524,
+-    "stock_set_position": SPLASH_CALLS["stock_set_position"],
+     "stock_set_size": 0x11070,
+-    "stock_add_flag": SPLASH_CALLS["stock_add_flag"],
+-    "stock_clear_flag": SPLASH_CALLS["stock_clear_flag"],
+     "stock_bg_color": 0x3A1B4,
+     "stock_bg_opacity": 0x3A1DC,
+     "stock_text_color": 0x3A23C,
+@@ -52,6 +61,17 @@
+     "stock_text_align": 0x3A2C0,
+     "stock_pad_top": 0x3A0E8,
+     "stock_radius": 0x3A164,
++    "stock_lv_alloc": 0x3F184,
++    "stock_lv_free": 0x3F1B0,
++    "stock_obj_delete": 0x3A2F4,
++    "stock_group_create": 0x349B4,
++    "stock_group_add": 0x34A70,
++    "stock_group_delete": 0x34A04,
++    "stock_keypad": 0xF7A4,
++    "stock_wheel": 0xF7B4,
++    "stock_bind_group": 0x40490,
++    "stock_close_page": 0x30148,
++    "stock_return_home": 0x24F68,
+ }
+ 
+ 
+@@ -60,52 +80,35 @@
+         raise SystemExit(message)
+ 
+ 
+-def compile_c(prefix, work, name, *, splash=False, action=False, handheld=False, tiles=False):
+-    flags = ["-DSPLASH"] if splash else []
+-    if action:
+-        flags.append("-DACTION")
+-    if handheld:
+-        flags.append("-DHANDHELD")
+-    if tiles:
+-        flags.append("-DHANDHELD_LAYOUT")
+-    if tiles in ("polish", "color"):
+-        flags.append("-DHANDHELD_POLISH")
+-    if tiles == "color":
+-        flags.append("-DHANDHELD_COLOR")
+-    call_model = "-mno-longcalls" if (action or handheld) and name != "smoke" else "-mlongcalls"
++def compile_c(prefix, work, name):
++    model = "-mlongcalls" if name == "smoke" else "-mno-longcalls"
+     run([f"{prefix}-gcc", "-c", "-fstack-usage", "-Os", "-std=c11", "-Wall", "-Wextra", "-Werror",
+          "-ffreestanding", "-fno-stack-protector", "-mabi=windowed", "-mtext-section-literals",
+-         call_model, *flags, "-o", f"{name}.o", HERE / f"{name}.c"], cwd=work, check=True)
+-
+-
+-def link(prefix, work, sections, *, fixture=False, splash=False, action=False, handheld=False, tiles=False):
+-    entry = "_start" if fixture else "native_menu_create"
++         model, "-DHANDHELD", "-DHANDHELD_LAYOUT", "-DHANDHELD_POLISH", "-DHANDHELD_COLOR",
++         "-I", work, "-o", f"{name}.o", HERE / f"{name}.c"], cwd=work, check=True)
++
++
++def link(prefix, work, sections=()):
++    fixture = bool(sections)
+     base = SIM if fixture else BASE
+-    layout = [f"ENTRY({entry})"]
++    layout = [f"ENTRY({'_start' if fixture else 'native_menu_create'})"]
+     if not fixture:
+-        layout.extend(["stock_nodev = 0x001ca384;", "stock_label_class = 0x2004cf10;",
+-                       "stock_set_text = 0x2001d554;", "stock_get_child = 0x200412a0;"])
+-        if handheld:
+-            layout.append("stock_group_send = 0x20034f78;")
+-        if splash:
+-            layout.extend([f"{name} = {BASE + offset:#x};" for name, offset in SPLASH_CALLS.items()])
+-            layout.extend(["stock_group_send = 0x20034f78;", "stock_image_class = 0x2004ce78;",
+-                           "splash_state = 0x0018342c;"])
+-        if action or handheld:
+-            layout.extend(f"{name} = {BASE + offset:#x};" for name, offset in ACTION_CALLS.items())
+-            layout.extend(["stock_nodev_name = 0x20060690;", "stock_page_manager = 0x001ca330;"])
+-        if handheld:
+-            layout.append("handheld_state = 0x0018342c;")
+-        if tiles:
+-            layout.append(f"stock_menu_font = {MENU_FONT:#x};")
+-            layout.extend(f"{name} = {BASE + offset:#x};" for name, offset in (TILE_CALLS | RECLAIM_CALLS).items())
+-        if tiles in ("polish", "color"):
+-            layout.append(f"stock_compact_font = {COMPACT_FONT:#x};")
++        layout += [
++            "stock_nodev = 0x001ca384;", "stock_label_class = 0x2004cf10;",
++            "stock_set_text = 0x2001d554;", "stock_get_child = 0x200412a0;",
++            "stock_event_add = 0x20034840;", "stock_group_send = 0x20034f78;",
++            "stock_nodev_name = 0x20060690;", "stock_page_manager = 0x001ca330;",
++            "handheld_state = 0x0018342c;", "stock_menu_font = 0x001ca068;",
++            "stock_compact_font = 0x20060a70;", "stock_image_class = 0x2004ce78;",
++            "stock_audio_notice = 0x001ca0f8;", "stock_fan_notice = 0x001ca25c;",
++            "stock_audio_name = 0x20060684;", "stock_fan_name = 0x2006067c;",
++        ]
++        layout.extend(f"{name} = {BASE + offset:#x};" for name, offset in CALLS.items())
+     layout.append("SECTIONS {")
+     layout.extend(f"  .{name} {SIM + address:#x} : {{ *(.{name}) }}" for name, address in sections)
+-    sources = ["handheld"] if handheld else ["menu", "splash"] if splash else ["menu"]
+-    code = " ".join(f"{name}.o(.literal* .text* .rodata*)" for name in sources)
+-    layout.append(f"  .extension {base + EXTENSION:#x} : {{ {code} }}")
++    layout.extend(f"  .{name} {base + start:#x} : {{ handheld.o(.{name}) }}"
++                  for name, (start, _) in SLOTS.items())
++    layout.append(f"  .extension {base + FACTORY_ENTRY + 4:#x} : {{ handheld.o(.literal* .text* .rodata*) }}")
+     if fixture:
+         layout.append("  .fixture 0x60075000 : { smoke.o(.literal* .text* .rodata*) }")
+     layout.extend(["  .data : { *(.data* .sdata*) }", "  .bss : { *(.bss* .sbss* COMMON) }"])
+@@ -113,112 +116,150 @@
+         layout.append('  ASSERT(SIZEOF(.data) == 0 && SIZEOF(.bss) == 0, "unexpected menu RAM")')
+     layout.extend(["  /DISCARD/ : { *(.comment .note* .eh_frame*) }", "}"])
+     (work / "layout.ld").write_text("\n".join(layout))
+-    objects = [f"{name}.o" for name in sources]
+-    if fixture:
+-        objects.extend(["start.o", "smoke.o"])
++    objects = ["handheld.o", "start.o", "smoke.o"] if fixture else ["handheld.o"]
+     run([f"{prefix}-ld", "-EL", "--no-relax", "-T", "layout.ld", "-o", "menu.elf", *objects],
+         cwd=work, check=True)
+-    symbols = run([f"{prefix}-nm", "--defined-only", "menu.elf"], cwd=work, check=True,
+-                  capture_output=True, text=True).stdout
+-    return {name: int(address, 16) for address, _, name in (line.split() for line in symbols.splitlines())}
++    lines = run([f"{prefix}-nm", "--defined-only", "menu.elf"], cwd=work, check=True,
++                capture_output=True, text=True).stdout.splitlines()
++    return {name: int(address, 16) for address, _, name in map(str.split, lines)}
++
++
++def references(dsp, start, end):
++    """All address-shaped words, including unaligned instruction overlaps."""
++    return {offset: value - BASE for offset in range(len(dsp) - 3)
++            if start <= (value := unpack_from("<I", dsp, offset)[0]) - BASE < end}
++
++
++def entry_calls(dsp, target):
++    result = []
++    for offset in range(RAM_COPY - 2):
++        if dsp[offset] & 0x3f not in (5, 0x15, 0x25, 0x35):
++            continue
++        encoded = int.from_bytes(dsp[offset:offset + 3], "little") >> 6
++        displacement = encoded - 0x40000 if encoded >= 0x20000 else encoded
++        if (offset & ~3) + 4 + 4 * displacement == target:
++            result.append(offset)
++    return result
++
++
++def verify_retirements(stock, reference):
++    ranges = [(FACTORY_ENTRY, FACTORY_END), *SLOTS.values(), (SHELL_DEMO, SHELL_DEMO + 5)]
++    require(all(stock[start:end] == reference[start:end] for start, end in ranges),
++            "A retirement range does not match exact retail v4.8")
++    require(entry_calls(stock, FACTORY_ENTRY) == [0x298B2] and
++            references(stock, FACTORY_ENTRY, FACTORY_END) ==
++            {0xEC34: 0x2C136, 0x17434: 0x2ABAE, 0x18673: 0x2C206, 0x1E9A2: 0x2BD00},
++            "Unexpected factory entry or interior pointer-shaped word")
++    for name, (slot, table, targets, literal, entry) in RETIRED_PAGES.items():
++        start, end = SLOTS["retired_" + name.split("_")[0]]
++        allowed = {slot: entry, **{table + 4 * i: address for i, address in enumerate(targets)}}
++        require(not entry_calls(stock, start) and references(stock, start, end) == allowed and
++                references(stock, table, table + 36) == {literal: table},
++                f"Unexpected reference into the {name} handler or lifecycle table")
++        require(all(stock[offset:offset + 4] == reference[offset:offset + 4] for offset in allowed),
++                f"Changed retail {name} lifecycle table or page registry")
++    start, end = SLOTS["retired_dump"]
++    require(not entry_calls(stock, start) and references(stock, start, end) == {DUMP_POINTER: start}
++            and references(stock, SHELL_DEMO, SHELL_DEMO + 5) == {0x41A50: SHELL_DEMO}
++            and reference[SHELL_DEMO:SHELL_DEMO + 5] == bytes.fromhex("3641001df0"),
++            "Unexpected diagnostic shell command or demo handler")
++    require(stock[DUMP_POINTER:DUMP_POINTER + 4] == reference[DUMP_POINTER:DUMP_POINTER + 4],
++            "Changed retail dump_AirConfig shell registration")
++    print("Verified factory, Audio, Fan, and shell entry, table and provenance checks", flush=True)
+ 
+ 
+ def patch_call(candidate, offset, expected, target):
+     require(candidate[offset:offset + 3] == bytes.fromhex(expected), f"Unexpected call at {offset:#x}")
+     displacement = target - ((BASE + offset) & ~3) - 4
+     require(displacement % 4 == 0 and -0x80000 <= displacement < 0x80000, f"Invalid call8 at {offset:#x}")
+-    instruction = (((displacement // 4) & 0x3FFFF) << 6) | 0x25
++    instruction = (((displacement // 4) & 0x3ffff) << 6) | 0x25
+     candidate[offset:offset + 3] = instruction.to_bytes(3, "little")
+ 
+ 
+-def build(prefix, work, reference, *, splash=False, action=False, handheld=False, tiles=False):
+-    compile_c(prefix, work, "handheld" if handheld else "menu",
+-              splash=splash, action=action, handheld=handheld, tiles=tiles)
+-    if splash:
+-        compile_c(prefix, work, "splash", splash=True, action=action)
+-    if tiles:
+-        require(unpack_from("<I", reference, 0x1847C)[0] == MENU_FONT,
+-                "Expected the stock nodev label font")
+-    if tiles in ("polish", "color"):
+-        require(unpack_from("<I", reference, 0x195DC)[0] == COMPACT_FONT and
+-                unpack_from("<HH", reference, COMPACT_FONT - BASE + 8) == (16, 3),
+-                "Expected the stock default font with a 16-pixel line height")
+-    symbols = link(prefix, work, (), splash=splash, action=action, handheld=handheld, tiles=tiles)
+-    run([f"{prefix}-objcopy", "-O", "binary", "-j", ".extension", "menu.elf", "extension.bin"],
+-        cwd=work, check=True)
+-    extension = (work / "extension.bin").read_bytes()
+-    require(unpack_from("<I", reference, KEY_CALLBACK)[0] == 0x20040FB0, "Unexpected stock key callback")
++def build(prefix, work, stock, reference):
++    verify_retirements(stock, reference)
++    compile_c(prefix, work, "handheld")
++    symbols = link(prefix, work)
+     candidate = bytearray(reference)
+     for name, offset in (("native_menu_create", SET_TEXT_CALL), ("handheld_report", REPORT_CALL)):
+         require(candidate[offset] & 0x3f == 0x25, f"Expected pinned call8 at {offset:#x}")
+         patch_call(candidate, offset, candidate[offset:offset + 3].hex(), symbols[name])
+     patch_call(candidate, FRESH_CALL, "250425", symbols["splash_first_press"])
+-    require(candidate[0x298b2:0x298b5].hex() == "25fd00" and
+-            candidate[FACTORY_ENTRY:FACTORY_ENTRY + 3].hex() == "36a102",
+-            "Expected original diagnostic constructor target")
++    require(candidate[0x298B2:0x298B5].hex() == "25fd00", "Expected original factory constructor call")
+     displacement = symbols["factory_compact"] - BASE - FACTORY_ENTRY - 4
+-    require(0 <= displacement < 0x20000, "Factory redirect out of range")
+-    redirect = (0x06 | (displacement << 6)).to_bytes(3, "little")
+-    region = redirect + b"\xff" + extension
+-    capacity = FACTORY_END - FACTORY_ENTRY
+-    require(len(region) <= capacity, "Factory window overflow")
+-    candidate[FACTORY_ENTRY:FACTORY_END] = region.ljust(capacity, b"\xff")
+-    changed_calls = {i for offset in (SET_TEXT_CALL, REPORT_CALL, FRESH_CALL)
+-                     for i in range(offset, offset + 3)}
+-    require(len(candidate) == len(reference) <= 0x70000 and
+-            all(old == new or i in changed_calls or FACTORY_ENTRY <= i < FACTORY_END
++    require(0 <= displacement < 0x20000, "Factory jump out of range")
++    redirect = (0x06 | (displacement << 6)).to_bytes(3, "little") + b"\xff"
++
++    changed = [range(offset, offset + 3) for offset in (SET_TEXT_CALL, FRESH_CALL, REPORT_CALL)]
++    regions = {"extension": (FACTORY_ENTRY, FACTORY_END), **SLOTS}
++    for section, (start, end) in regions.items():
++        payload = work / f"{section}.bin"
++        run([f"{prefix}-objcopy", "-O", "binary", "-j", f".{section}", "menu.elf", payload],
++            cwd=work, check=True)
++        content = (redirect if section == "extension" else b"") + payload.read_bytes()
++        require(len(content) <= end - start, f"{section} exceeds its retired interval")
++        candidate[start:end] = content.ljust(end - start, b"\xff")
++        changed.append(range(start, end))
++        print(f"{section:14} {end - start:4} bytes, {len(content):4} used, {end - start - len(content):4} free",
++              flush=True)
++    for name, (slot, table, _, _, _) in RETIRED_PAGES.items():
++        pack_into("<I", candidate, slot, symbols[name])
++        candidate[table:table + 36] = bytes(36)
++        changed.extend([range(slot, slot + 4), range(table, table + 36)])
++    pack_into("<I", candidate, DUMP_POINTER, BASE + SHELL_DEMO)
++    changed.append(range(DUMP_POINTER, DUMP_POINTER + 4))
++
++    require(len(candidate) == len(reference) == 458540 <= 0x70000 and
++            all(old == new or any(i in region for region in changed)
+                 for i, (old, new) in enumerate(zip(reference, candidate))),
+-            "Unexpected changes outside factory and menu call sites")
+-    splash_offset = symbols["splash_icon"] - BASE
+-    art = bytes(int(word, 16) for word in re.findall(r"0x([0-9a-fA-F]{2})\b",
+-                                                     (HERE / "splash_icon.inc").read_text()))
+-    require(len(art) == 928 and candidate[splash_offset:splash_offset + len(art)] == art,
+-            "Expected the exact original splash bytes")
+-    print(f"Factory window {capacity} bytes, {len(region)} used, {capacity - len(region)} free", flush=True)
+-
++            "Unexpected change to stock DSP footprint or protected bytes")
++    for _, (start, end) in SLOTS.items():
++        require(all(any(site in region for region in changed)
++                    for site in references(candidate, start, end)),
++                "Stale reference to retired function interior outside approved patch sites")
+     return candidate, symbols
+ 
+ 
+-def smoke(prefix, work, candidate, symbols, *, splash=False, action=False, handheld=False, tiles=False):
+-    callback, = unpack_from("<I", candidate, KEY_CALLBACK)
++def smoke(prefix, work, candidate, symbols):
++    def rebase(data):
++        return b"".join(pack("<I", address - BASE + SIM) for (address,) in
++                        ((unpack_from("<I", data, j)[0],) for j in range(0, len(data), 4)))
++
++    def ram(start, end):
++        return candidate[RAM_COPY + start - 0x9b000:RAM_COPY + end - 0x9b000]
++
++    require(unpack_from("<II", candidate, 0x6228) == (0x9B6E8, 0x9B734),
++            "Expected shared stock panel window and byte-writer call targets")
++    require(unpack_from("<I", candidate, 0x3e388)[0] == 0x000a5354,
++            "Expected native indexed line reader")
+     files = {
+-        "callback": pack("<I", callback - BASE + SIM),
++        "callback": rebase(candidate[KEY_CALLBACK:KEY_CALLBACK + 4]),
+         "registration": candidate[0x31584:0x31590],
+         "label_call": candidate[SET_TEXT_CALL:SET_TEXT_CALL + 3],
+         "group_send": candidate[0x34F78:0x34F99],
+         "event_dispatch": candidate[0x346FC:0x34814],
+         "child_getter": candidate[0x412A0:0x412C1],
++        "fresh_call": candidate[FRESH_CALL:FRESH_CALL + 3],
++        "report_dispatch": candidate[0x50E8:0x50FC],
++        "panel_fill": candidate[0x6230:0x62B3],
++        "panel_flush_tail": candidate[0xF76A:0xF776],
++        "stock_color_default": candidate[0x3F514:0x3F5FE],
++        "factory_entry": candidate[FACTORY_ENTRY:FACTORY_ENTRY + 4],
++        "factory_dispatch": candidate[0x29890:0x298B7],
++        "factory_table": rebase(candidate[FACTORY_TABLE:FACTORY_TABLE + 36]),
++        "page_lookup": candidate[0x30049:0x30055],
++        "page_table": rebase(candidate[PAGE_TABLE:PAGE_TABLE + 22 * 8]),
++        "shell_lookup": rebase(candidate[DUMP_POINTER:DUMP_POINTER + 4]),
++        "shell_demo": candidate[SHELL_DEMO:SHELL_DEMO + 5],
++        "indexed_palette": candidate[0x3E267:0x3E2C8],
++        "indexed_src": ram(0xA53B5, 0xA53B7) + ram(0xA53B9, 0xA53BD),
++        "indexed_row": ram(0xA53DC, 0xA5434),
+     }
+-    if splash or handheld:
+-        files["fresh_call"] = candidate[FRESH_CALL:FRESH_CALL + 3]
+-    if action or handheld:
+-        files["report_dispatch"] = candidate[0x50E8:0x50FC]
+-    if tiles == "color":
+-        require(unpack_from("<II", candidate, 0x6228) == (0x9B6E8, 0x9B734),
+-                "Expected shared stock panel window and byte-writer call targets")
+-        files["panel_fill"] = candidate[0x6230:0x62B3]
+-        files["panel_flush_tail"] = candidate[0xF76A:0xF776]
+-        files["stock_color_default"] = candidate[0x3F514:0x3F5FE]
+-    if handheld:
+-        files["factory_entry"] = candidate[FACTORY_ENTRY:EXTENSION]
+-        files["factory_dispatch"] = candidate[0x29890:0x298b7]
+-        for i, expected in enumerate((0x298ab, 0x298ab, 0x298ad, 0x298ab, 0x298ab,
+-                                      0x298ab, 0x298ab, 0x298ab, 0x298ab)):
+-            require(unpack_from("<I", candidate, 0x472c0 + 4 * i)[0] == BASE + expected,
+-                    "Unexpected factory page dispatch target")
+     for name, data in files.items():
+         (work / f"{name}.bin").write_bytes(data)
+-    defines = ["--defsym", "SPLASH=1"] if splash else []
+-    if handheld:
+-        defines.extend(["--defsym", "FACTORY_PROOF=1"])
+-    if action or handheld:
+-        defines.extend(["--defsym", "REPORT=1"])
+-    if tiles:
+-        defines.extend(["--defsym", "TILES=1"])
+-    if tiles == "color":
+-        defines.extend(["--defsym", "COLOR=1"])
+-    run([f"{prefix}-as", "--no-transform", *defines, "-o", "start.o", HERE / "smoke.S"], cwd=work, check=True)
+-    compile_c(prefix, work, "smoke", splash=splash, action=action, handheld=handheld, tiles=tiles)
++    run([f"{prefix}-as", "--no-transform", "--defsym", "FACTORY_PROOF=1", "--defsym", "REPORT=1",
++         "--defsym", "TILES=1", "--defsym", "COLOR=1", "-o", "start.o", HERE / "smoke.S"], cwd=work, check=True)
++    compile_c(prefix, work, "smoke")
+     sections = [
+         ("vectors", 0), ("start", 0x400), ("registration_literal", KEY_CALLBACK),
+         ("registration", 0x31581), ("label_call", SET_TEXT_CALL - 7),
+@@ -226,70 +267,67 @@
+         ("label_setter", 0x1D554), ("event_register", 0x34840),
+         ("event_literals", 0x346F0), ("event_dispatch", 0x346FC), ("group_focus", 0x410A8),
+         ("event_context", 0xFC7C), ("class_preflight", 0x41010), ("event_bubble", 0x410D0),
+-        ("bubble_flag", 0x5108),
++        ("bubble_flag", 0x5108), ("fresh_call", FRESH_CALL - 7), ("factory_entry", FACTORY_ENTRY),
++        ("factory_dispatch", 0x29890), ("factory_table_literal", 0x29888), ("factory_table", FACTORY_TABLE),
++        ("nodev_callback", 0x40FB0), ("report_dispatch", 0x50E8), ("stock_reset_idle", 0x22D94),
++        ("panel_alloc_literals", 0x47B8), ("panel_io_literals", 0x6220), ("panel_fill", 0x6230),
++        ("panel_flush_tail", 0xF76A - 7), ("stock_color_default", 0x3F514),
++        ("page_lookup", 0x30049 - 5), ("page_table_literal", 0x30030), ("page_table", PAGE_TABLE),
++        ("shell_lookup", 0x41F00), ("shell_decl", DUMP_POINTER), ("shell_demo", SHELL_DEMO),
++        ("indexed_palette", 0x71000), ("indexed_row", 0x71100), ("splash_expected", 0x80000),
++        *CALLS.items(),
+     ]
+-    entries = ["native_menu_create"]
+-    if not handheld:
+-        entries.append("native_menu_key")
+-    if splash:
+-        sections.extend((name, offset) for name, offset in SPLASH_CALLS.items())
+-        sections.append(("fresh_call", FRESH_CALL - 7))
+-        entries.append("splash_fresh_group_send")
+-    if handheld:
+-        sections.extend([("fresh_call", FRESH_CALL - 7), ("factory_entry", FACTORY_ENTRY),
+-                         ("factory_dispatch", 0x29890), ("factory_table_literal", 0x29888),
+-                         ("factory_table", 0x472c0), ("nodev_callback", 0x40fb0)])
+-        entries.extend(["splash_first_press", "factory_compact", "climate_render_value"])
+-    if action or handheld:
+-        sections.extend((name, offset) for name, offset in ACTION_CALLS.items())
+-        sections.extend([("report_dispatch", 0x50E8), ("stock_reset_idle", 0x22D94)])
+-        entries.append("handheld_report" if handheld else "menu_action_report")
+-    if tiles:
+-        sections.extend((TILE_CALLS | RECLAIM_CALLS).items())
+-    if tiles == "color":
+-        sections.extend([("panel_alloc_literals", 0x47B8), ("panel_io_literals", 0x6220),
+-                         ("panel_fill", 0x6230), ("panel_flush_tail", 0xF76A - 7),
+-                         ("stock_color_default", 0x3F514)])
+-    test_symbols = link(prefix, work, sections, fixture=True, splash=splash,
+-                        action=action, handheld=handheld, tiles=tiles)
+-    for name in entries:
+-        require(test_symbols[name] - SIM == symbols[name] - BASE,
+-                f"Fixture changed the address of {name}")
+-    run(["qemu-system-xtensa", "-M", "sim", "-cpu", "de212", "-m", "16M", "-display", "none",
+-         "-monitor", "none", "-serial", "none", "-semihosting", "-device", "loader,file=menu.elf,cpu-num=0"],
+-        cwd=work, check=True, timeout=10)
+-    if handheld:
+-        print("Xtensa stock factory create redirect, splash timing and keys, image slots, TV panel and Climate fixture passed")
+-        print("Xtensa handheld native label, local navigation, and v1 packet fixture passed")
+-    else:
+-        print("Xtensa native label, key registration, dispatch and child lookup fixture passed")
+-    if splash:
+-        print("Xtensa splash one-shot, early dismissal and wake-state fixture passed")
+-    if action:
+-        print("Xtensa stock report and Controls A v1 packet fixture passed")
+-    if tiles == "color":
+-        print("Xtensa exact stock fill and flush instructions agreed on the palette bytes")
++    test_symbols = link(prefix, work, sections)
++    for name in ("native_menu_create", "handheld_report", "splash_first_press", "factory_compact",
++                 "audio_notice", "fan_notice", "climate_render_value", "unpack_splash"):
++        require(test_symbols[name] - SIM == symbols[name] - BASE, f"Fixture changed address of {name}")
++    status = run(["qemu-system-xtensa", "-M", "sim", "-cpu", "de212", "-m", "16M", "-display", "none",
++                  "-monitor", "none", "-serial", "none", "-semihosting",
++                  "-device", "loader,file=menu.elf,cpu-num=0"], cwd=work, timeout=10)
++    require(not status.returncode, f"Xtensa fixture stopped at line modulo 256 = {status.returncode}")
++    print("Xtensa fixture passed: exact indexed frame, splash lifetime and keys, factory/Audio/Fan and shell,"
++          " stock flush, Activities/TV navigation and packets, and Climate labels")
++
++
++def load(path, zip_hash, dsp_hash, *, only_dsp=False):
++    require(sha256(path.read_bytes()).hexdigest() == zip_hash, f"Unexpected archive digest for {path.name}")
++    with ZipFile(path) as archive:
++        if only_dsp:
++            require(archive.namelist() == ["DSP.bin"], "Expected the DSP-only reference ZIP")
++        dsp = archive.read("DSP.bin")
++    require(sha256(dsp).hexdigest() == dsp_hash, "Unexpected DSP member")
++    return dsp
+ 
+ 
+ def main():
+-    parser = argparse.ArgumentParser(description="Offline QEMU factory-slot proof. Writes no firmware package.")
++    parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("color_baseline", type=Path)
++    parser.add_argument("stock_v48", type=Path)
++    parser.add_argument("approved_png", type=Path)
+     parser.add_argument("--tool-prefix", default="xtensa-esp32-elf")
++    parser.add_argument("--output", type=Path, help="optional new .OFFLINE.zip after successful QEMU")
+     args = parser.parse_args()
++    if args.output:
++        require(args.output.name.endswith(".OFFLINE.zip"), "Use a new .OFFLINE.zip output path")
+     prefix = str(Path(args.tool_prefix).expanduser().resolve()) if "/" in args.tool_prefix else args.tool_prefix
+-    require(sha256(args.color_baseline.read_bytes()).hexdigest() == BASELINE_SHA,
+-            "Expected the exact corrected color candidate ZIP")
+-    with ZipFile(args.color_baseline) as archive:
+-        require(archive.namelist() == ["DSP.bin"], "Expected the DSP-only ZIP")
+-        reference = archive.read("DSP.bin")
+-    require(sha256(reference).hexdigest() == DSP_SHA, "Unexpected DSP member")
+-    with TemporaryDirectory(prefix="offline-factory-proof-") as directory:
++    stock = load(args.stock_v48, STOCK_ARCHIVE_SHA, STOCK_DSP_SHA)
++    reference = load(args.color_baseline, COLOR_ZIP_SHA, COLOR_DSP_SHA, only_dsp=True)
++    with TemporaryDirectory(prefix="full-splash-proof-") as directory:
+         work = Path(directory)
+-        candidate, symbols = build(prefix, work, reference, handheld=True, tiles="color")
++        prepare(args.approved_png, work)
++        candidate, symbols = build(prefix, work, stock, reference)
+         run([f"{prefix}-size", "-A", "handheld.o"], cwd=work, check=True)
+-        print((work / "handheld.su").read_text())
+-        smoke(prefix, work, candidate, symbols, handheld=True, tiles="color")
+-        print(f"Offline in-memory DSP {len(candidate)} bytes, SHA-256 {sha256(candidate).hexdigest()}")
++        print((work / "handheld.su").read_text(), flush=True)
++        smoke(prefix, work, candidate, symbols)
++    print(f"DSP.bin {len(candidate)} bytes, SHA-256 {sha256(candidate).hexdigest()}, "
++          f"FreqChip CRC {crc32(candidate, 0xffffffff):08x}")
++    if args.output:
++        with ZipFile(args.output, "x") as archive:
++            archive.writestr(ZipInfo("DSP.bin"), candidate, compress_type=ZIP_DEFLATED)
++        with ZipFile(args.output) as archive:
++            require(archive.namelist() == ["DSP.bin"] and archive.read("DSP.bin") == candidate,
++                    "Unexpected offline ZIP contents")
++        print(f"ZIP SHA-256 {sha256(args.output.read_bytes()).hexdigest()}")
+ 
+ 
+ if __name__ == "__main__":
+--- /dev/null
++++ b/firmware/dsp-v48-native-menu/encode_full_splash.py
+@@ -0,0 +1,115 @@
++"""Generate lossless native 2 bpp crops from the pinned 240 × 320 splash."""
++
++from hashlib import sha256
++
++from PIL import Image
++
++
++ART_SHA = "9ef6c703149eaccc16ee07a4c1d402f24e4a565ddf0a4eded836e144c4a33554"
++COLORS = tuple(bytes.fromhex(hex_rgb) for hex_rgb in ("0a152a", "faf7f2", "50dcfe", "848890"))
++CROPS = ((77, 44, 88, 145), (41, 200, 160, 28), (20, 233, 200, 27))
++
++
++def pack_2bpp(indices):
++    return bytes((a << 6) | (b << 4) | (c << 2) | d
++                 for a, b, c, d in zip(indices[::4], indices[1::4], indices[2::4], indices[3::4]))
++
++
++def compress(raw):
++    """Optimal byte count for literal blocks and 256-byte-window back references."""
++    end = len(raw)
++    costs = [0] * (end + 1)
++    choices = [None] * end
++    for at in range(end - 1, -1, -1):
++        count = min(range(1, min(128, end - at) + 1), key=lambda n: n + costs[at + n])
++        best = (1 + count + costs[at + count], count, 0)
++        longest = 2
++        limit = min(130, end - at)
++        for distance in range(1, min(256, at) + 1):
++            source = at - distance
++            length = 0
++            while length < limit and raw[at + length] == raw[source + length]:
++                length += 1
++            if length > longest:
++                count = min(range(longest + 1, length + 1), key=lambda n: costs[at + n])
++                option = (2 + costs[at + count], count, distance)
++                best = min(best, option)
++                longest = length
++                if length == limit:
++                    break
++        costs[at] = best[0]
++        choices[at] = best[1:]
++    packed = bytearray()
++    at = 0
++    while at < end:
++        count, distance = choices[at]
++        if distance:
++            packed.extend((0x80 | (count - 3), distance - 1))
++        else:
++            packed.append(count - 1)
++            packed.extend(raw[at:at + count])
++        at += count
++    return bytes(packed)
++
++
++def decompress(packed):
++    """Independent check of the generator output before compiling target code."""
++    pixels = bytearray()
++    at = 0
++    while at < len(packed):
++        token = packed[at]
++        at += 1
++        if token & 0x80:
++            distance = packed[at] + 1
++            at += 1
++            for _ in range((token & 0x7f) + 3):
++                pixels.append(pixels[-distance])
++        else:
++            count = token + 1
++            pixels.extend(packed[at:at + count])
++            at += count
++    return bytes(pixels)
++
++
++def c_array(name, data):
++    lines = [f"static const uint8_t {name}[] = {{"]
++    for at in range(0, len(data), 16):
++        lines.append("    " + " ".join(f"0x{value:02x}," for value in data[at:at + 16]))
++    return "\n".join([*lines, "};"])
++
++
++def prepare(approved, work):
++    if sha256(approved.read_bytes()).hexdigest() != ART_SHA:
++        raise SystemExit("Expected the exact approved four-color splash PNG")
++    with Image.open(approved) as image:
++        rgb = image.convert("RGB")
++    if rgb.size != (240, 320) or set(rgb.get_flattened_data()) != {tuple(color) for color in COLORS}:
++        raise SystemExit("Unexpected splash dimensions or colors")
++    lookup = {tuple(color): index for index, color in enumerate(COLORS)}
++    original = bytes(lookup[color] for color in rgb.get_flattened_data())
++    canvas = bytearray(240 * 320)
++    palette = b"".join(color[::-1] + b"\xff" for color in COLORS)
++    header = [c_array("splash_palette", palette)]
++    sizes = []
++    for index, (x, y, width, height) in enumerate(CROPS):
++        indices = bytes(lookup[color] for color in rgb.crop((x, y, x + width, y + height)).get_flattened_data())
++        raw = pack_2bpp(indices)
++        packed = compress(raw)
++        restored = decompress(packed)
++        if restored != raw:
++            raise SystemExit("The packed splash data failed round-trip verification")
++        decoded = bytes((value >> shift) & 3 for value in restored for shift in (6, 4, 2, 0))
++        for row in range(height):
++            start = (y + row) * 240 + x
++            canvas[start:start + width] = decoded[row * width:(row + 1) * width]
++        sizes.append(len(packed))
++        header.append(c_array(f"splash_crop_{index}", packed))
++    if canvas != original:
++        raise SystemExit("The decoded crops and navy matte differ from the approved frame")
++    header.append("static const struct packed_crop splash_crops[] = {")
++    header.extend(f"    {{splash_crop_{i}, sizeof splash_crop_{i}, {x}, {y}, {w}, {h}}},"
++                  for i, (x, y, w, h) in enumerate(CROPS))
++    header.append("};")
++    (work / "splash_packed.inc").write_text("\n".join(header) + "\n")
++    (work / "splash_expected.bin").write_bytes(pack_2bpp(original))
++    print(f"Full-frame pixel proof: 76,800 identical pixels. Crop streams {sizes}, {sum(sizes)} bytes.", flush=True)
+--- a/firmware/dsp-v48-native-menu/handheld.c
++++ b/firmware/dsp-v48-native-menu/handheld.c
+@@ -75,8 +75,9 @@
+     FOCUS_TEXT = NATIVE_RGB565(0x1922), PRIMARY = NATIVE_RGB565(0xf79d),
+     SECONDARY = NATIVE_RGB565(0xadb5),
+     TITLE_CHILD = 2, MODE_CHILD, FEEDBACK_CHILD, FIRST_SLOT_CHILD,
+-    NOTE_CHILD = FIRST_SLOT_CHILD + 4, FIRST_MARK_CHILD, SPLASH_CHILD = FIRST_MARK_CHILD + 3,
+-    SPLASH_VISIBLE = 1, SPLASH_SHOWN = 2,
++    NOTE_CHILD = FIRST_SLOT_CHILD + 4, BODY_CHILD, FIRST_MARK_CHILD, SPLASH_CHILD = NOTE_CHILD,
++    SPLASH_VISIBLE = 1, SPLASH_SHOWN = 2, IMAGE_DELETE = 0x21,
++    SPLASH_NAVY = NATIVE_RGB565(0x08a5),
+ };
+ 
+ #ifdef HANDHELD_POLISH
+@@ -114,13 +115,40 @@
+ extern void stock_timer_repeat(void *timer, int32_t count);
+ extern int stock_group_send(void *group, uint32_t key);
+ 
+-#include "splash_icon.inc"
++extern void *stock_lv_alloc(size_t size);
++extern void stock_lv_free(void *memory);
++extern void stock_obj_delete(void *object);
++extern void stock_event_add(void *object, void (*callback)(const struct stock_event *),
++                            unsigned code, const void *data);
++extern void *stock_group_create(void);
++extern void stock_group_add(void *group, void *object);
++extern void stock_group_delete(void *group);
++extern void *stock_keypad(void);
++extern void *stock_wheel(void);
++extern void stock_bind_group(void *input, void *group);
++extern void stock_close_page(void);
++extern void stock_return_home(void);
++extern const uint8_t stock_image_class[];
++
++struct packed_crop {
++    const uint8_t *stream;
++    uint16_t stream_size;
++    uint8_t x, y, width, height;
++};
++
++#include "splash_packed.inc"
+ #include "proof_marks.inc"
+ 
+-#define INDEXED_ICON(width, height, pixels) \
+-    {8 | ((width) << 10) | ((height) << 21), sizeof (pixels), (pixels)}
+-_Static_assert(sizeof splash_icon == 16 + 48 * 76 / 4, "original startup image size");
+-static const struct image_desc splash_art = INDEXED_ICON(48, 76, splash_icon);
++enum { SPLASH_CROPS = sizeof splash_crops / sizeof splash_crops[0] };
++
++struct notice_state {
++    void *parent;
++    void *group;
++};
++
++extern struct notice_state stock_audio_notice;
++extern struct notice_state stock_fan_notice;
++extern const char stock_audio_name[], stock_fan_name[];
+ 
+ static bool nodev_active(void)
+ {
+@@ -140,6 +168,8 @@
+ 
+ void *factory_compact(void *parent)
+ {
++    if (stock_get_child(parent, 0))
++        return parent;
+     stock_set_size(parent, 240, 320);
+     struct stock_label *label = stock_label_create(parent);
+     if (label)
+@@ -150,21 +180,27 @@
+ static void draw_decoration(void *container, unsigned view)
+ {
+     struct stock_label *note = stock_get_child(container, NOTE_CHILD);
+-    if (note) {
+-        if (view == TV)
+-            place(note, "TV controls\nDirection pad, channel\n& volume", 14, 106, 212, 73);
+-        else
+-            stock_add_flag(note, HIDDEN);
+-    }
++    struct stock_label *body = stock_get_child(container, BODY_CHILD);
++    if (note && view == TV)
++        place(note, "TV controls", 14, 106, 212, 73);
++    else if (note)
++        stock_add_flag(note, HIDDEN);
++    if (body && view == TV)
++        place(body, "Direction pad,\nchannel & volume", 26, 141, 152, 36);
++    else if (body)
++        stock_add_flag(body, HIDDEN);
++
+     for (unsigned i = 0; i < 3; ++i) {
+         void *image = stock_get_child(container, FIRST_MARK_CHILD + i);
+         if (!image)
+             break;
+-        if (view == ACTIVITIES) {
+-            stock_image_set_source(image, &marks[2 * i + (i == handheld_state.focus)]);
+-            stock_set_position(image, 23 + (i % 2) * 109, i < 2 ? 112 : 185);
++        if (view <= SCENES && i < screens[view].count) {
++            unsigned mark = 2 * (3 * view + i) + (i == handheld_state.focus);
++            stock_image_set_source(image, &marks[mark]);
++            int y = i < 2 ? 112 : (view == ACTIVITIES ? 186 : 179);
++            stock_set_position(image, 23 + (i % 2) * 109, y);
+         } else if (view == TV && i == 0) {
+-            stock_image_set_source(image, &marks[6]);
++            stock_image_set_source(image, &marks[TV_MARK]);
+             stock_set_position(image, 189, 130);
+         } else {
+             stock_add_flag(image, HIDDEN);
+@@ -192,7 +228,7 @@
+     place(mode, tv ? "TV mode" : "Menu mode", 14, MODE_Y, 212, 22);
+     bool climate = view == CLIMATE;
+     if (tv)
+-        place(feedback, "Back and Home stay in TV", 14, 189, 212, 21);
++        place(feedback, "Hard Back and Home\nstay in TV mode", 14, 189, 212, 36);
+     else if (climate)
+         place(feedback, "No reading yet", 14, 159, 212, 21);
+     else if (!tv && view >= SCENES)
+@@ -210,12 +246,13 @@
+             continue;
+         }
+         bool focused = !climate && !tv && i == handheld_state.focus;
+-        stock_text_align(slot, climate || view == ACTIVITIES ? LEFT_ALIGN : CENTER_ALIGN, MAIN);
++        bool artwork = view <= SCENES;
++        stock_text_align(slot, climate || artwork ? LEFT_ALIGN : CENTER_ALIGN, MAIN);
+         stock_bg_color(slot, climate ? PANEL : focused ? FOCUS : TILE, MAIN);
+         stock_text_color(slot, climate && !i ? SECONDARY : focused ? FOCUS_TEXT : PRIMARY, MAIN);
+         bool activities = view == ACTIVITIES;
+-        stock_pad_left(slot, activities ? 9 : 0, MAIN);
+-        stock_pad_top(slot, climate ? 0 : tv ? 7 : activities ? 24 : TILE_PAD_TOP, MAIN);
++        stock_pad_left(slot, artwork ? 9 : 0, MAIN);
++        stock_pad_top(slot, climate ? 0 : tv ? 7 : artwork ? 28 : TILE_PAD_TOP, MAIN);
+         stock_radius(slot, tv || climate ? 0 : TILE_RADIUS, MAIN);
+         if (climate)
+             place(slot, i ? "--" : "Current temperature", 14, i ? 132 : 105, 212, 20);
+@@ -232,12 +269,17 @@
+ /* Called only after the upstream state decoder has validated and formatted the value. */
+ void climate_render_value(const char *reading, bool stale)
+ {
+-    if (!reading || !nodev_active() || handheld_state.view != CLIMATE)
++    if (!nodev_active() || handheld_state.view != CLIMATE)
+         return;
+     void *container = stock_nodev.container;
+     struct stock_label *value = stock_get_child(container, FIRST_SLOT_CHILD + 1);
+     struct stock_label *feedback = stock_get_child(container, FEEDBACK_CHILD);
+     if (value && feedback) {
++        if (!reading) {
++            stock_set_text(value, "--");
++            stock_set_text(feedback, "No reading yet");
++            return;
++        }
+         stock_set_text(value, reading);
+         stock_set_text(feedback, stale ? "Last known" : "");
+     }
+@@ -253,6 +295,18 @@
+     draw(label);
+ }
+ 
++static void remove_splash(void *container)
++{
++    for (unsigned i = 0; i < SPLASH_CROPS; ++i) {
++        void *image = stock_get_child(container, SPLASH_CHILD);
++        if (!image || *(const void **)image != stock_image_class)
++            break;
++        stock_obj_delete(image);
++    }
++}
++
++static void add_decoration(void *container);
++
+ static void finish_splash(void)
+ {
+     if (handheld_state.startup != SPLASH_VISIBLE || !stock_nodev.root || !stock_nodev.container)
+@@ -260,10 +314,9 @@
+     struct stock_label *label = stock_get_child(stock_nodev.container, 1);
+     if (!label || label->class_pointer != stock_label_class)
+         return;
+-    void *image = stock_get_child(stock_nodev.container, SPLASH_CHILD);
+-    if (image)
+-        stock_add_flag(image, HIDDEN);
+     handheld_state.startup = SPLASH_SHOWN;
++    remove_splash(stock_nodev.container);
++    add_decoration(stock_nodev.container);
+     show_menu(label);
+ }
+ 
+@@ -283,45 +336,192 @@
+     return result;
+ }
+ 
+-static bool add_decoration(void *container)
++static void add_decoration(void *container)
+ {
+     struct stock_label *note = stock_label_create(container);
+     if (!note)
+-        return false;
++        return;
+     stock_text_font(note, stock_compact_font, MAIN);
+     stock_text_color(note, PRIMARY, MAIN);
+     stock_bg_color(note, NATIVE_RGB565(0x2144), MAIN);
+     stock_bg_opacity(note, 255, MAIN);
+     stock_text_align(note, LEFT_ALIGN, MAIN);
+-    stock_pad_top(note, 7, MAIN);
++    stock_pad_top(note, 12, MAIN);
+     stock_pad_left(note, 12, MAIN);
+     stock_radius(note, 4, MAIN);
+     stock_add_flag(note, HIDDEN);
++    struct stock_label *body = stock_label_create(container);
++    if (!body)
++        return;
++    stock_text_font(body, stock_compact_font, MAIN);
++    stock_text_color(body, SECONDARY, MAIN);
++    stock_text_align(body, LEFT_ALIGN, MAIN);
++    stock_add_flag(body, HIDDEN);
+     for (unsigned i = 0; i < 3; ++i) {
+         void *image = stock_image_create(container);
+         if (!image)
++            return;
++        stock_add_flag(image, HIDDEN);
++    }
++}
++
++__attribute__((section(".retired_dump")))
++bool unpack_splash(uint8_t *pixels, size_t size, const uint8_t *stream, size_t length)
++{
++    uint8_t *out = pixels;
++    uint8_t *end = out + size;
++    const uint8_t *limit = stream + length;
++    while (stream != limit) {
++        unsigned token = *stream++;
++        size_t count = (token & 0x7f) + 1;
++        if (token & 0x80) {
++            count += 2;
++            if (stream == limit || count > (size_t)(end - out))
++                return false;
++            size_t distance = *stream++ + 1;
++            if (distance > (size_t)(out - pixels))
++                return false;
++            const uint8_t *previous = out - distance;
++            while (count--)
++                *out++ = *previous++;
++        } else {
++            if (count > (size_t)(limit - stream) || count > (size_t)(end - out))
++                return false;
++            while (count--)
++                *out++ = *stream++;
++        }
++    }
++    return out == end;
++}
++
++static void free_splash(const struct stock_event *event)
++{
++    /* Parent teardown can precede the one-shot timer. */
++    if (handheld_state.startup == SPLASH_VISIBLE)
++        handheld_state.startup = SPLASH_SHOWN;
++    stock_lv_free((void *)event->user_data);
++}
++
++__attribute__((noinline, section(".retired_fan")))
++static bool add_splash_crop(void *container, const struct packed_crop *crop)
++{
++    size_t pixel_size = (size_t)crop->width * crop->height / 4;
++    struct image_desc *source = stock_lv_alloc(sizeof *source + sizeof splash_palette + pixel_size);
++    if (!source)
++        return false;
++    uint8_t *data = (uint8_t *)(source + 1);
++    if (!unpack_splash(data + sizeof splash_palette, pixel_size, crop->stream, crop->stream_size)) {
++        stock_lv_free(source);
++        return false;
++    }
++    for (unsigned i = 0; i < sizeof splash_palette; ++i)
++        data[i] = splash_palette[i];
++    *source = (struct image_desc){
++        8 | ((uint32_t)crop->width << 10) | ((uint32_t)crop->height << 21),
++        sizeof splash_palette + pixel_size, data
++    };
++    void *image = stock_image_create(container);
++    if (!image) {
++        stock_lv_free(source);
++        return false;
++    }
++    stock_event_add(image, free_splash, IMAGE_DELETE, source);
++    stock_image_set_source(image, source);
++    stock_set_position(image, crop->x, crop->y);
++    return true;
++}
++
++static bool start_splash(void *container, struct stock_label *label)
++{
++    for (unsigned i = 0; i < SPLASH_CROPS; ++i) {
++        if (!add_splash_crop(container, &splash_crops[i])) {
++            remove_splash(container);
+             return false;
+-        stock_add_flag(image, HIDDEN);
+-    }
+-    return true;
+-}
+-
+-static bool start_splash(void *container, struct stock_label *label)
+-{
+-    void *image = stock_image_create(container);
+-    if (!image)
++        }
++    }
++    void *timer = stock_timer_create(splash_timeout, 3000, NULL);
++    if (!timer) {
++        remove_splash(container);
+         return false;
+-    stock_add_flag(image, HIDDEN);
+-    void *timer = stock_timer_create(splash_timeout, 3000, NULL);
+-    if (!timer)
+-        return false;
++    }
+     stock_timer_repeat(timer, 1);
+-    stock_image_set_source(image, &splash_art);
+-    stock_set_position(image, 96, 105);
+-    stock_set_text(label, "ALMOST\nUNIVERSAL");
+-    stock_clear_flag(image, HIDDEN);
++    stock_bg_color(container, SPLASH_NAVY, MAIN);
++    stock_bg_opacity(container, 255, MAIN);
++    stock_add_flag(label, HIDDEN);
+     handheld_state.startup = SPLASH_VISIBLE;
+     return true;
++}
++
++static void notice_key(const struct stock_event *event)
++{
++    const struct notice_state *notice = (const void *)event->user_data;
++    if (!event->parameter || !notice || event->target != notice->parent ||
++        !stock_page_manager ||
++        stock_active_page() != (notice == &stock_audio_notice ? stock_audio_name : stock_fan_name))
++        return;
++    switch (*event->parameter) {
++    case 0x00040000:  /* Hard Back */
++        stock_close_page();
++        break;
++    case 0x04000000:  /* Hard Home */
++        stock_return_home();
++        break;
++    }
++}
++
++__attribute__((section(".retired_audio")))
++static void device_notice(const struct stock_event *event, struct notice_state *notice,
++                          const char *text)
++{
++    switch (event->code) {
++    case 0x2e: {  /* Page manager's create event. Parameter word 1 is its container. */
++        if (!event->parameter || !event->parameter[1] || notice->parent)
++            return;
++        void *container = (void *)(uintptr_t)event->parameter[1];
++        stock_set_size(container, 240, 320);
++        stock_bg_color(container, PANEL, MAIN);
++        stock_bg_opacity(container, 255, MAIN);
++        struct stock_label *label = stock_label_create(container);
++        if (label) {
++            stock_text_font(label, stock_compact_font, MAIN);
++            stock_text_color(label, PRIMARY, MAIN);
++            place(label, text, 14, 104, 212, 70);
++        }
++        notice->parent = container;
++        notice->group = stock_group_create();
++        if (notice->group)
++            stock_group_add(notice->group, container);
++        stock_event_add(container, notice_key, 13, notice);
++        stock_bind_group(stock_wheel(), NULL);
++        break;
++    }
++    case 0x2f:  /* Reactivate after a child page closes. */
++        break;
++    case 0x34:  /* Destroy the private group before releasing the container. */
++        if (!notice->parent)
++            return;
++        if (notice->group)
++            stock_group_delete(notice->group);
++        stock_bind_group(stock_keypad(), NULL);
++        stock_bind_group(stock_wheel(), NULL);
++        notice->group = NULL;
++        notice->parent = NULL;
++        return;
++    default:
++        return;
++    }
++    if (notice->group)
++        stock_bind_group(stock_keypad(), notice->group);
++}
++
++void audio_notice(const struct stock_event *event)
++{
++    device_notice(event, &stock_audio_notice, "Audio profile unavailable\nBack to return");
++}
++
++void fan_notice(const struct stock_event *event)
++{
++    device_notice(event, &stock_fan_notice, "Fan profile unavailable\nBack to return");
+ }
+ 
+ void native_menu_create(struct stock_label *label, const char *stock_caption)
+@@ -359,9 +559,10 @@
+     void *icon = stock_get_child(container, 0);
+     if (icon)
+         stock_add_flag(icon, HIDDEN);
+-    if (add_decoration(container) && handheld_state.startup == 0 && start_splash(container, label))
++    if (handheld_state.startup == 0 && start_splash(container, label))
+         return;
+     handheld_state.startup = SPLASH_SHOWN;
++    add_decoration(container);
+     show_menu(label);
+ }
+ #else
+--- a/firmware/dsp-v48-native-menu/proof_marks.inc
++++ b/firmware/dsp-v48-native-menu/proof_marks.inc
+@@ -52,6 +52,77 @@
+     0x00, 0x00, 0x00, 0x00, 0x15, 0x54, 0x00, 0x00, 0x00, 0x00, 0x15, 0x54, 0x00, 0x00, 0x00, 0x00,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+ };
++static const uint8_t nested_mark_0[] = {
++    0x18, 0x20, 0x18, 0xff, 0xac, 0xb6, 0xac, 0xff, 0xac, 0xb6, 0xac, 0xff, 0xac, 0xb6, 0xac, 0xff,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x15, 0x54, 0x00, 0x00, 0x50, 0x05, 0x00,
++    0x00, 0x40, 0x01, 0x00, 0x01, 0x40, 0x01, 0x40, 0x01, 0x40, 0x01, 0x40, 0x00, 0x40, 0x01, 0x00,
++    0x00, 0x50, 0x05, 0x00, 0x00, 0x15, 0x54, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x05, 0x50, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++static const uint8_t nested_mark_1[] = {
++    0x94, 0xee, 0xd5, 0xff, 0x10, 0x24, 0x18, 0xff, 0x10, 0x24, 0x18, 0xff, 0x10, 0x24, 0x18, 0xff,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x15, 0x54, 0x00, 0x00, 0x50, 0x05, 0x00,
++    0x00, 0x40, 0x01, 0x00, 0x01, 0x40, 0x01, 0x40, 0x01, 0x40, 0x01, 0x40, 0x00, 0x40, 0x01, 0x00,
++    0x00, 0x50, 0x05, 0x00, 0x00, 0x15, 0x54, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x05, 0x50, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++static const uint8_t nested_mark_2[] = {
++    0x18, 0x20, 0x18, 0xff, 0xac, 0xb6, 0xac, 0xff, 0xac, 0xb6, 0xac, 0xff, 0xac, 0xb6, 0xac, 0xff,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x04, 0x10, 0x00, 0x00, 0x04, 0x10, 0x00,
++    0x00, 0x04, 0x10, 0x00, 0x00, 0x04, 0x10, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x05, 0x50, 0x00,
++    0x00, 0x05, 0x50, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x15, 0x54, 0x00,
++    0x00, 0x15, 0x54, 0x00, 0x00, 0x15, 0x54, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++static const uint8_t nested_mark_3[] = {
++    0x94, 0xee, 0xd5, 0xff, 0x10, 0x24, 0x18, 0xff, 0x10, 0x24, 0x18, 0xff, 0x10, 0x24, 0x18, 0xff,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x04, 0x10, 0x00, 0x00, 0x04, 0x10, 0x00,
++    0x00, 0x04, 0x10, 0x00, 0x00, 0x04, 0x10, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x05, 0x50, 0x00,
++    0x00, 0x05, 0x50, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x15, 0x54, 0x00,
++    0x00, 0x15, 0x54, 0x00, 0x00, 0x15, 0x54, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++static const uint8_t nested_mark_4[] = {
++    0x18, 0x20, 0x18, 0xff, 0xac, 0xb6, 0xac, 0xff, 0xac, 0xb6, 0xac, 0xff, 0xac, 0xb6, 0xac, 0xff,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x55, 0x55, 0x50, 0x04, 0x00, 0x00, 0x10,
++    0x04, 0x00, 0x00, 0x10, 0x05, 0x55, 0x55, 0x50, 0x04, 0x00, 0x00, 0x10, 0x04, 0x00, 0x00, 0x10,
++    0x05, 0x55, 0x55, 0x50, 0x04, 0x00, 0x00, 0x10, 0x04, 0x00, 0x00, 0x10, 0x05, 0x55, 0x55, 0x50,
++    0x04, 0x00, 0x00, 0x10, 0x04, 0x00, 0x00, 0x10, 0x05, 0x55, 0x55, 0x50, 0x00, 0x00, 0x00, 0x00,
++};
++static const uint8_t nested_mark_5[] = {
++    0x94, 0xee, 0xd5, 0xff, 0x10, 0x24, 0x18, 0xff, 0x10, 0x24, 0x18, 0xff, 0x10, 0x24, 0x18, 0xff,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x55, 0x55, 0x50, 0x04, 0x00, 0x00, 0x10,
++    0x04, 0x00, 0x00, 0x10, 0x05, 0x55, 0x55, 0x50, 0x04, 0x00, 0x00, 0x10, 0x04, 0x00, 0x00, 0x10,
++    0x05, 0x55, 0x55, 0x50, 0x04, 0x00, 0x00, 0x10, 0x04, 0x00, 0x00, 0x10, 0x05, 0x55, 0x55, 0x50,
++    0x04, 0x00, 0x00, 0x10, 0x04, 0x00, 0x00, 0x10, 0x05, 0x55, 0x55, 0x50, 0x00, 0x00, 0x00, 0x00,
++};
++static const uint8_t nested_mark_6[] = {
++    0x18, 0x20, 0x18, 0xff, 0xac, 0xb6, 0xac, 0xff, 0xac, 0xb6, 0xac, 0xff, 0xac, 0xb6, 0xac, 0xff,
++    0x00, 0x00, 0x00, 0x00, 0x05, 0x55, 0x55, 0x50, 0x05, 0x05, 0x05, 0x00, 0x04, 0x14, 0x14, 0x10,
++    0x05, 0x55, 0x55, 0x50, 0x00, 0x00, 0x00, 0x00, 0x05, 0x55, 0x55, 0x50, 0x04, 0x00, 0x00, 0x10,
++    0x05, 0x55, 0x55, 0x50, 0x04, 0x00, 0x00, 0x10, 0x04, 0x00, 0x00, 0x10, 0x04, 0x00, 0x00, 0x10,
++    0x04, 0x00, 0x00, 0x10, 0x05, 0x55, 0x55, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++static const uint8_t nested_mark_7[] = {
++    0x94, 0xee, 0xd5, 0xff, 0x10, 0x24, 0x18, 0xff, 0x10, 0x24, 0x18, 0xff, 0x10, 0x24, 0x18, 0xff,
++    0x00, 0x00, 0x00, 0x00, 0x05, 0x55, 0x55, 0x50, 0x05, 0x05, 0x05, 0x00, 0x04, 0x14, 0x14, 0x10,
++    0x05, 0x55, 0x55, 0x50, 0x00, 0x00, 0x00, 0x00, 0x05, 0x55, 0x55, 0x50, 0x04, 0x00, 0x00, 0x10,
++    0x05, 0x55, 0x55, 0x50, 0x04, 0x00, 0x00, 0x10, 0x04, 0x00, 0x00, 0x10, 0x04, 0x00, 0x00, 0x10,
++    0x04, 0x00, 0x00, 0x10, 0x05, 0x55, 0x55, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++static const uint8_t nested_mark_8[] = {
++    0x18, 0x20, 0x18, 0xff, 0xac, 0xb6, 0xac, 0xff, 0xac, 0xb6, 0xac, 0xff, 0xac, 0xb6, 0xac, 0xff,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x01, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x14, 0x14, 0x00,
++    0x00, 0x50, 0x05, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 0x40, 0x01, 0x00, 0x15, 0x55, 0x55, 0x54,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x15, 0x55, 0x55, 0x54, 0x00, 0x00, 0x00, 0x00,
++};
++static const uint8_t nested_mark_9[] = {
++    0x94, 0xee, 0xd5, 0xff, 0x10, 0x24, 0x18, 0xff, 0x10, 0x24, 0x18, 0xff, 0x10, 0x24, 0x18, 0xff,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x01, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x14, 0x14, 0x00,
++    0x00, 0x50, 0x05, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 0x40, 0x01, 0x00, 0x15, 0x55, 0x55, 0x54,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x15, 0x55, 0x55, 0x54, 0x00, 0x00, 0x00, 0x00,
++};
++enum { TV_MARK = 16 };
+ static const struct image_desc marks[] = {
+     {8 | (16 << 10) | (16 << 21), sizeof mark_0, mark_0},
+     {8 | (16 << 10) | (16 << 21), sizeof mark_1, mark_1},
+@@ -59,5 +130,15 @@
+     {8 | (16 << 10) | (16 << 21), sizeof mark_3, mark_3},
+     {8 | (16 << 10) | (16 << 21), sizeof mark_4, mark_4},
+     {8 | (16 << 10) | (16 << 21), sizeof mark_5, mark_5},
++    {8 | (16 << 10) | (16 << 21), sizeof nested_mark_0, nested_mark_0},
++    {8 | (16 << 10) | (16 << 21), sizeof nested_mark_1, nested_mark_1},
++    {8 | (16 << 10) | (16 << 21), sizeof nested_mark_2, nested_mark_2},
++    {8 | (16 << 10) | (16 << 21), sizeof nested_mark_3, nested_mark_3},
++    {8 | (16 << 10) | (16 << 21), sizeof nested_mark_4, nested_mark_4},
++    {8 | (16 << 10) | (16 << 21), sizeof nested_mark_5, nested_mark_5},
++    {8 | (16 << 10) | (16 << 21), sizeof nested_mark_6, nested_mark_6},
++    {8 | (16 << 10) | (16 << 21), sizeof nested_mark_7, nested_mark_7},
++    {8 | (16 << 10) | (16 << 21), sizeof nested_mark_8, nested_mark_8},
++    {8 | (16 << 10) | (16 << 21), sizeof nested_mark_9, nested_mark_9},
+     {8 | (24 << 10) | (24 << 21), sizeof mark_6, mark_6},
+ };
+--- a/firmware/dsp-v48-native-menu/smoke.c
++++ b/firmware/dsp-v48-native-menu/smoke.c
+@@ -41,11 +41,18 @@
+ static struct stock_label splash_image;
+ static void *children[] = {&icon, &label, &splash_image};
+ #elif defined(HANDHELD_LAYOUT)
+-static void *children[14] = {&icon, &label};
++static void *children[16] = {&icon, &label};
+ #else
+ static void *children[] = {&icon, &label};
+ #endif
+-static struct { void **children; uint32_t count; } spec = {children, 2};
++static struct {
++    void **children;
++    uint32_t count;
++    uint32_t unused;
++    struct event_descriptor *events;
++    uint8_t other[10];
++    uint8_t event_count;
++} spec = {.children = children, .count = 2};
+ static struct { uint32_t prefix[2]; void *spec; } container = {{0, 0}, &spec};
+ static uint32_t group, changes, errors;
+ #ifdef HANDHELD_LAYOUT
+@@ -59,7 +66,33 @@
+     int x, y, w, h;
+     unsigned hidden, bg, opacity, fg, align, pad_top, pad_left, radius;
+     const struct image_desc *image;
+-} layout_labels[12];
++    void (*on_delete)(const struct stock_event *);
++    const void *delete_data;
++} layout_labels[14];
++const uint8_t stock_image_class[] = {3};
++extern const uint8_t original_splash_pixels[];
++extern int stock_indexed_palette(const struct image_desc *, uint16_t *, uint8_t *);
++extern void stock_indexed_row(const struct image_desc *, unsigned, unsigned,
++                              const uint16_t *, const uint8_t *, uint8_t *);
++extern bool unpack_splash(uint8_t *, size_t, const uint8_t *, size_t);
++
++static _Alignas(4) uint8_t crop_heap[3][3220];
++static unsigned crop_sizes[3], allocated, peak_allocated, alloc_attempts, fail_at;
++static bool fail_timer;
++
++static struct event_descriptor notice_event;
++static uint32_t keypad, wheel, notice_group;
++static void *keypad_group, *wheel_group;
++static unsigned groups_created, groups_deleted, returned_home, closed_notice;
++static bool notice_group_live;
++static void (*notice_callback)(const struct stock_event *);
++static uint32_t notice_page_payload[2];
++struct notice_state { void *parent; void *group; };
++struct notice_state stock_audio_notice, stock_fan_notice;
++const char stock_audio_name[] = "dev_AUDIO", stock_fan_name[] = "dev_FAN";
++extern void (*stock_page_callback(unsigned index))(const struct stock_event *);
++extern unsigned stock_retired_shell_call(unsigned argc);
++
+ static unsigned timer_runs;
+ static struct {
+     void (*callback)(void *);
+@@ -137,7 +170,12 @@
+         ++errors;
+         return NULL;
+     }
+-    struct stock_label *child = &layout_labels[spec.count - 2].label;
++    struct layout_label *item = &layout_labels[spec.count >= 2 ? spec.count - 2 : 0];
++    item->image = NULL;
++    item->on_delete = NULL;
++    item->delete_data = NULL;
++    item->hidden = 0;
++    struct stock_label *child = &item->label;
+     child->class_pointer = stock_label_class;
+     children[spec.count++] = child;
+     return child;
+@@ -190,7 +228,107 @@
+ 
+ void *fixture_image_create(void *parent)
+ {
+-    return fixture_label_create(parent);
++    struct stock_label *image = fixture_label_create(parent);
++    if (image)
++        image->class_pointer = stock_image_class;
++    return image;
++}
++
++void *fixture_lv_alloc(size_t size)
++{
++    if (++alloc_attempts == fail_at)
++        return NULL;
++    if (size != 3218 && size != 1148 && size != 1378) {
++        ++errors;
++        return NULL;
++    }
++    for (unsigned i = 0; i < 3; ++i) {
++        if (!crop_sizes[i]) {
++            crop_sizes[i] = size;
++            allocated += size;
++            if (allocated > peak_allocated)
++                peak_allocated = allocated;
++            return crop_heap[i];
++        }
++    }
++    ++errors;
++    return NULL;
++}
++
++void fixture_lv_free(void *memory)
++{
++    for (unsigned i = 0; i < 3; ++i) {
++        if (memory == crop_heap[i] && crop_sizes[i]) {
++            allocated -= crop_sizes[i];
++            crop_sizes[i] = 0;
++            return;
++        }
++    }
++    ++errors;
++}
++
++void fixture_obj_delete(void *object)
++{
++    struct layout_label *image = layout_child(object, 0);
++    if (!image->on_delete) {
++        ++errors;
++        return;
++    }
++    const struct stock_event event = {
++        .target = object, .current_target = object, .code = 0x21, .user_data = image->delete_data
++    };
++    image->on_delete(&event);
++    image->on_delete = NULL;
++    image->image = NULL;
++    image->hidden = 1;
++    unsigned i = 0;
++    while (i < spec.count && children[i] != object)
++        ++i;
++    if (i == spec.count) {
++        ++errors;
++        return;
++    }
++    for (; i + 1 < spec.count; ++i)
++        children[i] = children[i + 1];
++    children[--spec.count] = NULL;
++}
++
++void *fixture_group_create(void)
++{
++    if (notice_group_live)
++        ++errors;
++    notice_group_live = true;
++    ++groups_created;
++    return &notice_group;
++}
++
++void fixture_group_add(void *target_group, void *target)
++{
++    if (target_group != &notice_group || target != &container || !notice_group_live)
++        ++errors;
++}
++
++void fixture_group_delete(void *target_group)
++{
++    if (target_group != &notice_group || !notice_group_live)
++        ++errors;
++    notice_group_live = false;
++    ++groups_deleted;
++}
++
++void *fixture_keypad(void) { return &keypad; }
++void *fixture_wheel(void) { return &wheel; }
++
++void fixture_bind_group(void *input, void *target_group)
++{
++    if (target_group && (target_group != &notice_group || !notice_group_live))
++        ++errors;
++    if (input == &keypad)
++        keypad_group = target_group;
++    else if (input == &wheel)
++        wheel_group = target_group;
++    else
++        ++errors;
+ }
+ 
+ void fixture_image_source(void *object, const struct image_desc *source)
+@@ -202,6 +340,8 @@
+ {
+     if (!callback || period != 3000 || user_data)
+         ++errors;
++    if (fail_timer)
++        return NULL;
+     proof_timer.callback = callback;
+     proof_timer.period = period;
+     proof_timer.repeats = -1;
+@@ -250,7 +390,7 @@
+ {
+     struct layout_label *child = layout_child(object, selector);
+ #ifdef HANDHELD_POLISH
+-    const void *expected = child == &layout_labels[0] ? stock_menu_font : stock_compact_font;
++    const void *expected = child == &layout_labels[0] && spec.count != 1 ? stock_menu_font : stock_compact_font;
+ #else
+     (void)child;
+     const void *expected = stock_menu_font;
+@@ -271,6 +411,18 @@
+ void fixture_register(void *target, void (*callback)(const struct stock_event *), unsigned code,
+                       const struct page_objects *user_data)
+ {
++    if (target == &container && code == 13 && user_data && callback) {
++        notice_event = (struct event_descriptor){callback, user_data, code};
++        spec.events = &notice_event;
++        spec.event_count = 1;
++        return;
++    }
++    if (code == 0x21 && user_data && callback) {
++        struct layout_label *image = layout_child(target, 0);
++        image->on_delete = callback;
++        image->delete_data = user_data;
++        return;
++    }
+     if (target != &root || code != 13 || user_data != &stock_nodev || !callback)
+         ++errors;
+     descriptor.callback = callback;
+@@ -281,6 +433,8 @@
+ 
+ void *fixture_get_focused(void *target_group)
+ {
++    if (target_group == &notice_group && notice_group_live)
++        return &container;
+     if (target_group != &group)
+         ++errors;
+     return stock_nodev.root;
+@@ -290,6 +444,22 @@
+ const char stock_nodev_name[] = "nodev";
+ void *stock_page_manager = &root;
+ static const char *active_page = stock_nodev_name;
++
++static void notice_lifecycle(unsigned code)
++{
++    const struct stock_event event = {.code = code, .parameter = notice_page_payload};
++    notice_callback(&event);
++}
++
++void fixture_close_page(void)
++{
++    ++closed_notice;
++}
++
++void fixture_return_home(void)
++{
++    ++returned_home;
++}
+ static uint8_t last_frame[13];
+ static const uint8_t *expected_raw;
+ static unsigned normalized, sent;
+@@ -369,8 +539,10 @@
+ #ifdef HANDHELD_LAYOUT
+ #ifdef HANDHELD_POLISH
+ enum {
++    MenuTitle = 0, PanelNote = 7, PanelBody = 8, FirstMark = 9, FirstCrop = 7,
++    MenuChildCount = 14, SplashChildCount = 12, FirstCropChild = 9,
+     TitleY = 45, TitleHeight = 32, ModeY = 79,
+-    RowOne = 104, RowTwo = 178, TileHeight = 61, TilePad = 24, TileRadius = 5,
++    RowOne = 104, RowTwo = 178, TileHeight = 61, TilePad = 28, TileRadius = 5,
+     IdleFill = 0x1903, FooterX = 1, FooterWidth = 58,
+ };
+ #else
+@@ -453,61 +625,211 @@
+ }
+ #endif
+ 
++static int check_splash_pixels(void)
++{
++    static const unsigned expected[3][4] = {{77,44,88,145}, {41,200,160,28}, {20,233,200,27}};
++    static const uint8_t bgra[] = {
++        0x2a,0x15,0x0a,255, 0xf2,0xf7,0xfa,255, 0xfe,0xdc,0x50,255, 0x90,0x88,0x84,255
++    };
++    static const uint16_t native565[] = {0xa508, 0xbeff, 0xff56, 0x5284};
++    uint16_t palette[3][4];
++    uint8_t alpha[3][4];
++    for (unsigned i = 0; i < 3; ++i) {
++        const struct layout_label *crop = &layout_labels[FirstCrop + i];
++        CHECK(crop->image && !crop->hidden && crop->x == (int)expected[i][0] &&
++              crop->y == (int)expected[i][1]);
++        uint32_t w = expected[i][2], h = expected[i][3];
++        CHECK(crop->image->header == (8 | w << 10 | h << 21) &&
++              crop->image->data_size == 16 + w * h / 4);
++        for (unsigned j = 0; j < sizeof bgra; ++j)
++            CHECK(crop->image->data[j] == bgra[j]);
++        CHECK(stock_indexed_palette(crop->image, palette[i], alpha[i]) == 1);
++        for (unsigned j = 0; j < 4; ++j)
++            CHECK(palette[i][j] == native565[j] && alpha[i][j] == 255);
++    }
++    CHECK(panel_bg == native565[0] && color_matches(panel_bg, 0x08a5));
++    uint16_t composite[240];
++    uint8_t rgba_row[200 * 3];
++    for (unsigned y = 0; y < 320; ++y) {
++        for (unsigned x = 0; x < 240; ++x)
++            composite[x] = panel_bg;
++        for (unsigned i = 0; i < 3; ++i) {
++            unsigned x = expected[i][0], top = expected[i][1];
++            unsigned w = expected[i][2], h = expected[i][3];
++            if (y < top || y >= top + h)
++                continue;
++            stock_indexed_row(layout_labels[FirstCrop + i].image, 16 + (y-top) * (w/4), w,
++                              palette[i], alpha[i], rgba_row);
++            for (unsigned j = 0; j < w; ++j) {
++                CHECK(rgba_row[3*j+2] == 255);
++                composite[x+j] = rgba_row[3*j] | (unsigned)rgba_row[3*j+1] << 8;
++            }
++        }
++        for (unsigned x = 0; x < 240; ++x) {
++            unsigned pixel = y * 240 + x;
++            unsigned index = (original_splash_pixels[pixel/4] >> (6 - 2*(x&3))) & 3;
++            CHECK(composite[x] == native565[index]);
++        }
++    }
++    return 0;
++}
++
++static int check_retired_pages(void)
++{
++    /* The same stock page-manager table lookup chooses all three handlers. */
++    const uint32_t factory_payload[2] = {0, (uintptr_t)&container};
++    struct stock_event event = {.code = 45, .parameter = factory_payload};
++    void (*factory)(const struct stock_event *) = stock_page_callback(21);
++    CHECK(factory == stock_factory_dispatch);
++    spec.count = 0;
++    factory(&event);
++    CHECK(spec.count == 0);
++    event.code = 46;
++    factory(&event);
++    factory(&event);
++    CHECK(spec.count == 1 && equal(layout_labels[0].text, "Factory display unavailable"));
++    event.code = 52;
++    factory(&event);
++    spec.count = 0;                /* Native parent owns its child. */
++    event.code = 46;
++    factory(&event);
++    CHECK(spec.count == 1 && !proof_timer.callback && spec.event_count == 0);
++
++    notice_page_payload[1] = (uintptr_t)&container;
++    const char *names[] = {stock_fan_name, stock_audio_name};
++    const char *texts[] = {"Fan profile unavailable\nBack to return", "Audio profile unavailable\nBack to return"};
++    for (unsigned i = 0; i < 4; ++i) {
++        unsigned device = i % 2;
++        spec.count = spec.event_count = 0;
++        notice_callback = stock_page_callback(17 + device);
++        CHECK(notice_callback != NULL);
++        active_page = names[device];
++        /* Invalid teardown cannot unlink input from another page. */
++        keypad_group = &group;
++        wheel_group = &group;
++        notice_lifecycle(52);
++        CHECK(keypad_group == &group && wheel_group == &group && groups_deleted == i);
++        notice_lifecycle(45);
++        notice_lifecycle(46);
++        notice_lifecycle(46);
++        CHECK(groups_created == i + 1 && keypad_group == &notice_group && !wheel_group &&
++              spec.count == 1 && equal(layout_labels[0].text, texts[device]));
++        keypad_group = NULL;
++        notice_lifecycle(47);
++        CHECK(keypad_group == &notice_group);
++        stock_group_send(&notice_group, 0x200); /* A performs no retired action. */
++        CHECK(closed_notice == i && returned_home == i);
++        stock_group_send(&notice_group, 0x04000000);
++        CHECK(returned_home == i + 1);
++        stock_group_send(&notice_group, 0x40000);
++        CHECK(closed_notice == i + 1 && sent == 0);
++        notice_lifecycle(52);
++        notice_lifecycle(52);
++        CHECK(groups_deleted == i + 1 && !keypad_group && !wheel_group);
++        active_page = stock_nodev_name;
++        const uint32_t back = 0x40000;
++        const struct stock_event stale = {
++            .target = &container, .current_target = &container, .code = 13,
++            .user_data = notice_event.user_data, .parameter = &back
++        };
++        notice_event.callback(&stale);
++        CHECK(closed_notice == i + 1);
++    }
++    spec.count = 2;
++    children[0] = &icon;
++    children[1] = &label;
++    spec.event_count = 0;
++    CHECK(stock_retired_shell_call(9) == 9);
++    return 0;
++}
++
++static void reset_splash_fixture(void)
++{
++    spec.count = 2;
++    children[0] = &icon;
++    children[1] = &label;
++    changes = 0;
++    initial_label_hidden = 0;
++    handheld_state = (struct handheld_ram){0};
++    fail_at = alloc_attempts = 0;
++}
++
+ static int smoke_handheld(void)
+ {
+-    /* Execute the stock factory page callback and create branch from the image. */
+-    const uint32_t factory_payload[2] = {0, (uintptr_t)&container};
+-    struct stock_event event = {0};
+-    event.code = 45;
+-    event.parameter = factory_payload;
+-    stock_factory_dispatch(&event);
+-    CHECK(spec.count == 2);
+-    event.code = 46;
+-    stock_factory_dispatch(&event);
+-    CHECK(spec.count == 3 && equal(layout_labels[0].text, "Factory display unavailable"));
+-    spec.count = 2;
+-    changes = 0;
+-
++    int checked = check_retired_pages();
++    if (checked)
++        return checked;
++    reset_splash_fixture();
+     stock_registration(&stock_nodev);
+     stock_initial_label(&label, "LCD CHECK.");
+-    struct layout_label *splash = &layout_labels[11];
+-    CHECK(spec.count == 14 && !initial_label_hidden && !splash->hidden);
+-    CHECK(equal(label.text, "ALMOST\nUNIVERSAL") && layout_labels[0].hidden);
+-    CHECK(splash->image && splash->image->data_size == 928 && splash->x == 96 && splash->y == 105);
++    CHECK(spec.count == SplashChildCount && initial_label_hidden && layout_labels[0].hidden);
++    CHECK(allocated == 5744 && peak_allocated == 5744);
++    checked = check_splash_pixels();
++    if (checked)
++        return checked;
+     CHECK(proof_timer.repeats == 1 && proof_timer.period == 3000);
+     timer_tick(2999);
+-    CHECK(!timer_runs && !splash->hidden);
+-    stock_group_send(&group, 0x200); /* A repeat bypasses the fresh-press hook. */
+-    stock_first_press(&group, 0x80000); /* KATA stays with stock. */
+-    stock_first_press(&group, 0x200000); /* OFF stays with stock. */
+-    stock_first_press(&group, 0x600); /* A chord is ineligible. */
+-    CHECK(!splash->hidden);
+-    press(1, 0xf0); /* While the splash is active, direct the raw report to stock. */
+-    CHECK(normalized == 1 && !splash->hidden && sent == 0);
++    CHECK(!timer_runs && allocated == 5744);
++    stock_group_send(&group, 0x200); /* Stock repeat bypasses the fresh-press hook. */
++    stock_first_press(&group, 0x80000); /* KATA remains on the stock path. */
++    stock_first_press(&group, 0x100000); /* ON remains on the stock path. */
++    stock_first_press(&group, 0x200000); /* OFF remains on the stock path. */
++    stock_first_press(&group, 0x600); /* Chord is ineligible. */
++    press(0x4000, 0xf0);
++    press(0x10, 0xf1);
++    press(0x40, 0xf2);
++    press(1, 0xf3);
++    CHECK(normalized == 4 && allocated == 5744 && !sent);
+     stock_first_press(&group, 0x200);
+-    CHECK(splash->hidden && equal(layout_labels[0].text, "Activities"));
+-    raw_report(10, 1, 2, 0, 0xf1);
+-    raw_report(10, 0, 0, 0, 0xf2);
+-    unsigned before_timeout = changes;
++    CHECK(spec.count == MenuChildCount && !allocated && equal(layout_labels[0].text, "Activities"));
++    raw_report(10, 1, 2, 0, 0xf4);
++    raw_report(10, 0, 0, 0, 0xf5);
++    unsigned before = changes;
+     timer_tick(3000);
+     timer_tick(6000);
+-    CHECK(timer_runs == 1 && changes == before_timeout && sent == 0);
+-    press(0x80, 0xf3);
+-    CHECK(changes == before_timeout + 1 && sent == 0);
++    CHECK(timer_runs == 1 && changes == before && sent == 0);
++    press(0x80, 0xf6);
++    CHECK(changes == before + 1 && sent == 0);
+     CHECK(color_matches(layout_labels[4].bg, 0xd772));
+ 
+-    /* Model a fresh DSP boot, then verify timed expiry and same-boot page recreation. */
+-    changes = 0;
+-    spec.count = 2;
+-    initial_label_hidden = 0;
+-    handheld_state = (struct handheld_ram){0};
++    reset_splash_fixture();
+     stock_initial_label(&label, "LCD CHECK.");
+-    CHECK(!splash->hidden && proof_timer.callback && !initial_label_hidden);
++    CHECK(allocated == 5744 && proof_timer.callback);
+     timer_tick(3000);
+-    CHECK(timer_runs == 2 && splash->hidden && initial_label_hidden);
++    CHECK(timer_runs == 2 && !allocated && spec.count == MenuChildCount);
+     spec.count = 2;
+     stock_initial_label(&label, "LCD CHECK.");
+-    CHECK(spec.count == 13 && !proof_timer.callback && initial_label_hidden);
++    CHECK(spec.count == MenuChildCount && !proof_timer.callback && !allocated);
++
++    /* Native page deletion before the timer runs releases every crop. */
++    reset_splash_fixture();
++    stock_initial_label(&label, "LCD CHECK.");
++    for (unsigned i = 0; i < 3; ++i)
++        fixture_obj_delete(children[FirstCropChild]);
++    CHECK(!allocated && spec.count == FirstCropChild);
++    stock_nodev.root = NULL;
++    before = changes;
++    timer_tick(3000);
++    CHECK(timer_runs == 3 && changes == before && !proof_timer.callback);
++    stock_nodev.root = &root;
++
++    reset_splash_fixture();
++    fail_at = 2;
++    stock_initial_label(&label, "LCD CHECK.");
++    CHECK(!allocated && spec.count == MenuChildCount && !proof_timer.callback);
++    reset_splash_fixture();
++    fail_timer = true;
++    stock_initial_label(&label, "LCD CHECK.");
++    CHECK(!allocated && spec.count == MenuChildCount && !proof_timer.callback);
++    fail_timer = false;
++
++    uint8_t probe[4];
++    const uint8_t invalid[] = {0x80, 0xff}, short_input[] = {0x01, 0x00};
++    const uint8_t valid[] = {0, 0x55, 0x80, 0x00};
++    CHECK(!unpack_splash(probe, sizeof probe, invalid, sizeof invalid));
++    CHECK(!unpack_splash(probe, sizeof probe, short_input, sizeof short_input));
++    CHECK(!unpack_splash(probe, 3, valid, sizeof valid));
++    CHECK(unpack_splash(probe, sizeof probe, valid, sizeof valid) && probe[3] == 0x55);
+     changes = 1;
+     struct layout_label *title = &layout_labels[0];
+     struct layout_label *mode = &layout_labels[1];
+@@ -520,30 +842,34 @@
+     CHECK(color_matches(0xe007, 0x07e0) && color_matches(0x1f00, 0x001f));
+     CHECK(!color_matches(0x10a2, 0x10a2)); /* Reproduce the mismatched bench palette. */
+ #endif
+-    CHECK(spec.count == 13 && color_matches(panel_bg, 0x10a2) && panel_opacity == 255);
++    CHECK(spec.count == MenuChildCount && color_matches(panel_bg, 0x10a2) && panel_opacity == 255);
+     CHECK(icon_hidden && initial_label_hidden && feedback->hidden);
+     CHECK(equal(title->text, "Activities") && geometry(title, 14, TitleY, 212, TitleHeight));
+     CHECK(equal(mode->text, "Menu mode") && geometry(mode, 14, ModeY, 212, 22));
+     CHECK(color_matches(title->fg, 0xf79d) && color_matches(mode->fg, 0xadb5));
+     CHECK(equal(slots[0].text, "Watch TV") && geometry(&slots[0], 14, RowOne, 103, 68));
+-    CHECK(equal(slots[1].text, "Room\ncontrols") && slots[1].pad_top == 24 && geometry(&slots[1], 123, RowOne, 103, 68));
++    CHECK(equal(slots[1].text, "Room\ncontrols") && slots[1].pad_top == 28 && geometry(&slots[1], 123, RowOne, 103, 68));
+     CHECK(equal(slots[2].text, "Scenes") && geometry(&slots[2], 14, RowTwo, 103, TileHeight) && slots[3].hidden);
+     CHECK(color_matches(slots[0].bg, 0xd772) && color_matches(slots[0].fg, 0x1922) &&
+           color_matches(slots[1].bg, IdleFill) && color_matches(slots[1].fg, 0xf79d) &&
+           slots[1].radius == TileRadius);
+-    CHECK(layout_labels[8].image && layout_labels[8].image->data_size == 80 &&
+-          !layout_labels[8].hidden && layout_labels[8].x == 23 && layout_labels[8].y == 112);
+-    const struct image_desc *focused_mark = layout_labels[8].image;
++    CHECK(layout_labels[FirstMark].image && layout_labels[FirstMark].image->data_size == 80 &&
++          !layout_labels[FirstMark].hidden && layout_labels[FirstMark].x == 23 && layout_labels[FirstMark].y == 112);
++    const struct image_desc *focused_mark = layout_labels[FirstMark].image;
+     CHECK(slots[0].align == 1 && slots[0].pad_left == 9 && slots[0].opacity == 255 && slots[0].pad_top == TilePad);
+ 
+     press(0x80, 1);    /* Right focuses Room controls, Down finds an empty cell. */
+     press(0x2000, 2);
+     CHECK(color_matches(slots[1].bg, 0xd772) && color_matches(slots[0].bg, IdleFill) && changes == 2);
+-    CHECK(layout_labels[8].image != focused_mark);
++    CHECK(layout_labels[FirstMark].image != focused_mark);
++    const struct image_desc *activity_mark = layout_labels[FirstMark].image;
+     press(0x200, 3);   /* Open Room controls, focus Climate, then open it. */
++    CHECK(!layout_labels[FirstMark].hidden && layout_labels[FirstMark].image != activity_mark &&
++          layout_labels[FirstMark+2].y == 179);
+     press(0x80, 4);
+     press(0x200, 5);
+     CHECK(equal(title->text, "Climate") && equal(slots[0].text, "Current temperature"));
++    CHECK(layout_labels[FirstMark].hidden && layout_labels[FirstMark+1].hidden);
+     CHECK(geometry(&slots[0], 14, 105, 212, 20));
+     CHECK(geometry(&slots[1], 14, 132, 212, 20) && equal(slots[1].text, "--"));
+     CHECK(geometry(feedback, 14, 159, 212, 21) && equal(feedback->text, "No reading yet"));
+@@ -552,6 +878,8 @@
+     CHECK(equal(slots[1].text, "68.0\xc2\xb0" "F") && !*feedback->text);
+     climate_render_value("-9.0\xc2\xb0" "C", true);
+     CHECK(equal(slots[1].text, "-9.0\xc2\xb0" "C") && equal(feedback->text, "Last known"));
++    climate_render_value(NULL, false);
++    CHECK(equal(slots[1].text, "--") && equal(feedback->text, "No reading yet"));
+     unsigned drawings = changes;
+     press(0x200, 50);
+     press(0x80, 51);
+@@ -570,11 +898,16 @@
+     raw_report(10, 0x200, 2, 0, 11);
+     raw_report(10, 0, 0, 0, 12);
+     CHECK(equal(title->text, "Watch TV") && equal(mode->text, "TV mode") && sent == 0);
+-    CHECK(equal(feedback->text, "Back and Home stay in TV"));
+-    CHECK(geometry(&layout_labels[7], 14, 106, 212, 73) &&
+-          equal(layout_labels[7].text, "TV controls\nDirection pad, channel\n& volume"));
+-    CHECK(layout_labels[8].image->data_size == 160 && layout_labels[8].x == 189 &&
+-          !layout_labels[8].hidden && layout_labels[9].hidden && layout_labels[10].hidden);
++    CHECK(equal(feedback->text, "Hard Back and Home\nstay in TV mode") &&
++          geometry(feedback, 14, 189, 212, 36));
++    CHECK(geometry(&layout_labels[PanelNote], 14, 106, 212, 73) &&
++          equal(layout_labels[PanelNote].text, "TV controls"));
++    CHECK(geometry(&layout_labels[PanelBody], 26, 141, 152, 36) &&
++          equal(layout_labels[PanelBody].text, "Direction pad,\nchannel & volume") &&
++          color_matches(layout_labels[PanelBody].fg, 0xadb5));
++    CHECK(layout_labels[FirstMark].image->data_size == 160 && layout_labels[FirstMark].x == 189 &&
++          !layout_labels[FirstMark].hidden && layout_labels[FirstMark+1].hidden &&
++          layout_labels[FirstMark+2].hidden);
+     static const char *const captions[] = {"A\nInput", "B\nGuide", "C\nMenu", "D\nBack"};
+     for (unsigned i = 0; i < 4; ++i) {
+         CHECK(geometry(&slots[i], i * 60 + FooterX, 274, FooterWidth, 46) &&
+@@ -593,6 +926,13 @@
+     CHECK(equal(title->text, "Activities") && equal(mode->text, "Menu mode"));
+     CHECK(geometry(&slots[0], 14, RowOne, 103, 68) &&
+           color_matches(slots[0].bg, 0xd772) && slots[3].hidden);
++    press(0x2000, 17); /* Move to Scenes and verify both nested mark objects. */
++    press(0x200, 18);
++    CHECK(equal(title->text, "Scenes") && equal(slots[0].text, "Movie night") &&
++          equal(slots[1].text, "Evening") && !layout_labels[FirstMark].hidden &&
++          !layout_labels[FirstMark+1].hidden && layout_labels[FirstMark+2].hidden);
++    press(0x400, 19);
++    CHECK(equal(title->text, "Activities") && color_matches(slots[2].bg, 0xd772));
+     CHECK(sent == 3 && errors == 0);
+     return 0;
+ }
+--- a/firmware/dsp-v48-native-menu/smoke.S
++++ b/firmware/dsp-v48-native-menu/smoke.S
+@@ -212,11 +212,7 @@
+     .word factory_table
+ .section .factory_table,"a",@progbits
+ factory_table:
+-    .word stock_factory_dispatch + 27, stock_factory_dispatch + 27
+-    .word stock_factory_dispatch + 29
+-    .rept 6
+-    .word stock_factory_dispatch + 27
+-    .endr
++    .incbin "factory_table.bin"
+ 
+ return_value nodev_callback, 0
+ trampoline stock_pad_left, stock_pad_left, fixture_pad_left
+@@ -225,3 +221,103 @@
+ trampoline stock_timer_create, stock_timer_create, fixture_timer_create
+ trampoline stock_timer_repeat, stock_timer_repeat, fixture_timer_repeat
+ .endif
++
++.ifdef FACTORY_PROOF
++.global stock_event_add
++.set stock_event_add, fixture_register_entry
++
++trampoline stock_lv_alloc, stock_lv_alloc, fixture_lv_alloc
++trampoline stock_lv_free, stock_lv_free, fixture_lv_free
++trampoline stock_obj_delete, stock_obj_delete, fixture_obj_delete
++trampoline stock_group_create, stock_group_create, fixture_group_create
++trampoline stock_group_add, stock_group_add, fixture_group_add
++trampoline stock_group_delete, stock_group_delete, fixture_group_delete
++.section .stock_keypad,"ax",@progbits
++.global stock_keypad
++stock_keypad:
++    entry a1, 32
++    call8 fixture_keypad
++    mov.n a2, a10
++    retw.n
++.section .stock_wheel,"ax",@progbits
++.global stock_wheel
++stock_wheel:
++    entry a1, 32
++    call8 fixture_wheel
++    mov.n a2, a10
++    retw.n
++trampoline stock_bind_group, stock_bind_group, fixture_bind_group
++trampoline stock_close_page, stock_close_page, fixture_close_page
++trampoline stock_return_home, stock_return_home, fixture_return_home
++
++.section .page_table_literal,"a",@progbits
++    .word fixture_page_table
++.section .page_table,"a",@progbits
++fixture_page_table:
++    .incbin "page_table.bin"
++.section .page_lookup,"ax",@progbits
++.global stock_page_callback
++stock_page_callback:
++    entry a1, 48
++    s32i.n a2, a1, 0
++    .incbin "page_lookup.bin"
++    mov.n a2, a11
++    retw.n
++
++.section .shell_decl,"a",@progbits
++shell_decl:
++    .incbin "shell_lookup.bin"
++.section .shell_lookup,"ax",@progbits
++.global stock_retired_shell_call
++stock_retired_shell_call:
++    entry a1, 32
++    mov.n a10, a2
++    l32r a8, shell_decl
++    callx8 a8
++    mov.n a2, a10
++    retw.n
++.section .shell_demo,"ax",@progbits
++    .incbin "shell_demo.bin"
++
++.section .splash_expected,"a",@progbits
++.global original_splash_pixels
++original_splash_pixels:
++    .incbin "splash_expected.bin"
++
++/* Set up the same variable-source descriptor and palette pointers as stock. */
++.section .indexed_palette,"ax",@progbits
++.global stock_indexed_palette
++stock_indexed_palette:
++    entry a1, 80
++    s32i a2, a1, 36
++    s32i a3, a1, 24
++    s32i a4, a1, 28
++    addi a3, a1, 32
++    addi a6, a1, 16
++    movi.n a4, 4
++    movi a2, 0xf8
++    movi a5, 0xe0
++    movi.n a8, 0
++    movi.n a11, 0
++    .incbin "indexed_palette.bin"
++
++/* Stock RAM reader's variable-source access and scalar line loop, at x=0. */
++.section .indexed_row,"ax",@progbits
++.global stock_indexed_row
++stock_indexed_row:
++    entry a1, 64
++    s32i a7, a1, 12
++    s32i a4, a1, 8
++    movi.n a8, 2
++    s32i a8, a1, 4
++    s32i a5, a1, 24
++    s32i a6, a1, 28
++    addi a4, a1, 16
++    s32i a2, a1, 36
++    addi a2, a1, 32
++    mov.n a6, a3
++    movi.n a3, 6
++    .incbin "indexed_src.bin"
++    .incbin "indexed_row.bin"
++    retw.n
++.endif

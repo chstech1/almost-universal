@@ -3,12 +3,18 @@
     "step": {
       "init": {
         "title": "Bluetooth handheld",
-        "description": "Choose a discovered handheld or enter its Bluetooth address. You can use Bluetooth and MQTT independently.",
-        "data": {"ble_address": "Bluetooth address"}
+        "description": "Choose the firmware type and enter its Home Assistant Bluetooth address. For stock ARM, also enter the first six bytes of the SwitchBot manufacturer data for the same device. The Almost Universal handheld profile uses Bluetooth only.",
+        "data": {
+          "ble_mode": "Firmware type",
+          "ble_address": "Bluetooth address",
+          "stock_manufacturer_id": "Stock manufacturer ID",
+          "mqtt_enabled": "Enable MQTT simulator transport"
+        }
       }
     },
     "error": {
-      "invalid_address": "Enter a Bluetooth address such as AA:BB:CC:DD:EE:FF."
+      "invalid_address": "Enter this handheld's Bluetooth address as shown by Home Assistant.",
+      "invalid_manufacturer_id": "Enter the first six bytes as 12 hexadecimal digits."
     }
   },
   "config": {

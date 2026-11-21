@@ -1,0 +1,408 @@
+diff --git a/custom_components/ununiversal_remote/remote.py b/custom_components/ununiversal_remote/remote.py
+--- a/custom_components/ununiversal_remote/remote.py
++++ b/custom_components/ununiversal_remote/remote.py
+@@ -27,10 +27,12 @@
+     validate_menu,
+ )
+ from .protocol import compile_menu, decode_event
++from .state_protocol import StateSession
+ from .stock import (
+     STOCK_HANDHELD_MODE, STOCK_MODES, STOCK_SAMPLES, URM1_MODE,
+     StockRemote, decode_stock_event, stock_bindable, stock_menu,
+ )
++from .view_state import Field
+ 
+ LOGGER = logging.getLogger(__name__)
+ INPUT_EVENT = f"{DOMAIN}_input"
+@@ -221,6 +223,15 @@
+         climate = self.menu["screens"][screen_id]["climate"]
+         return self._temperature_status(climate) if climate else None
+ 
++    def make_state_session(self, client, activation, send):
++        """Prepare a read-only view session for a separately verified carrier."""
++        if self.ble_mode != STOCK_HANDHELD_MODE or self.ble is None or activation is None:
++            return None
++        room = Field(1, "climate.home", "temperature", "current_temperature",
++                     self.hass.config.units.temperature_unit, "temperature_unit")
++        session = StateSession(self.ble, client, activation, {4: (room,)}, self.hass.states.get, send)
++        return session if session.is_active() else None
++
+     def _temperature_status(self, climate):
+         state = self.hass.states.get(climate)
+         return temperature_status(
+diff --git a/custom_components/ununiversal_remote/state_protocol.py b/custom_components/ununiversal_remote/state_protocol.py
+new file mode 100644
+--- /dev/null
++++ b/custom_components/ununiversal_remote/state_protocol.py
+@@ -0,0 +1,108 @@
++"""Offline logical stock handheld snapshots and deltas. No GATT carrier."""
++
++from collections import deque
++from decimal import Decimal, ROUND_HALF_UP
++from struct import pack, unpack_from
++
++from .view_state import ViewState
++
++OPEN, SNAPSHOT, DELTA, CLOSE = 0x20, 0x21, 0x22, 0x23
++CONTROL_PREFIX = bytes.fromhex("7e 00 00 00 55 52 01")
++UPDATE_PREFIX = b"UR\x01"
++TEMPERATURE_UNIT = {"°C": 1, "°F": 2}
++
++
++def decode_view_control(frame):
++    if len(frame) != 14 or not frame.startswith(CONTROL_PREFIX):
++        return None
++    kind, screen, reserved, generation = unpack_from("<BBBI", frame, len(CONTROL_PREFIX))
++    if kind not in (OPEN, CLOSE) or not screen or reserved:
++        return None
++    return kind, screen, generation
++
++
++def _scaled_int(value, scale):
++    scaled = Decimal(str(value)) * scale
++    return int(scaled.to_integral_value(rounding=ROUND_HALF_UP))
++
++
++def _encode_field(field, value):
++    if value.available:
++        if field.kind == "boolean":
++            return 1, bytes([value.value])
++        if field.kind == "number" and -32768 <= value.value * field.scale <= 32767:
++            return 2, pack("<h", _scaled_int(value.value, field.scale))
++        if field.kind == "enum":
++            index = field.values.index(value.value)
++            if index <= 255:
++                return 3, bytes([index])
++        if (field.kind == "temperature" and isinstance(value.unit, str)
++                and value.unit in TEMPERATURE_UNIT and -999.9 <= value.value <= 999.9):
++            return 4, pack("<Bh", TEMPERATURE_UNIT[value.unit], _scaled_int(value.value, 10))
++    return 0, b""
++
++
++def encode_update(update, fields):
++    schema = {field.id: field for field in fields}
++    data = bytearray(UPDATE_PREFIX + pack(
++        "<BBBIH", SNAPSHOT if update.snapshot else DELTA, update.screen,
++        len(update.fields), update.generation, update.sequence,
++    ))
++    for field_id, value in sorted(update.fields.items()):
++        kind, encoded = _encode_field(schema[field_id], value)
++        data.extend((field_id, kind, len(encoded)))
++        data.extend(encoded)
++    if len(data) > 64:
++        raise ValueError("Logical handheld state payload exceeds 64 bytes")
++    return bytes(data)
++
++
++class StateSession:
++    """A caller with a verified send path can own one instance per session."""
++
++    def __init__(self, ble, client, activation, screens, get_state, send):
++        self._ble = ble
++        self._client = client
++        self._activation = activation
++        self._screens = screens
++        self._send = send
++        self._sending = False
++        self._recent = deque(maxlen=8)
++        self.view = ViewState(screens, get_state)
++
++    def is_active(self):
++        return self._ble.client is self._client and self._ble.is_active(self._activation)
++
++    def receive(self, frame):
++        if not self.is_active():
++            self.view.close()
++            return False
++        control = decode_view_control(frame)
++        if control is None:
++            return False
++        kind, screen, generation = control
++        if kind == CLOSE:
++            return self.view.close(screen, generation)
++        if (screen, generation) in self._recent or not self.view.open(screen, generation):
++            return False
++        self._recent.append((screen, generation))
++        return True
++
++    async def flush(self, now):
++        if not self.is_active():
++            self.view.close()
++            return False
++        if self._sending or (update := self.view.take(now)) is None:
++            return False
++        self._sending = True
++        try:
++            await self._send(self._client, encode_update(update, self._screens[update.screen]))
++        except BaseException:
++            self.view.close()
++            raise
++        finally:
++            self._sending = False
++        if not self.is_active():
++            self.view.close()
++            return False
++        return True
+diff --git a/custom_components/ununiversal_remote/view_state.py b/custom_components/ununiversal_remote/view_state.py
+new file mode 100644
+--- /dev/null
++++ b/custom_components/ununiversal_remote/view_state.py
+@@ -0,0 +1,107 @@
++"""Offline state projection from HA's registry into one active handheld view."""
++
++from dataclasses import dataclass
++from math import isfinite
++
++
++@dataclass(frozen=True)
++class Field:
++    id: int
++    entity_id: str
++    kind: str
++    attribute: str | None = None
++    unit: str | None = None
++    unit_attribute: str | None = None
++    scale: int = 1
++    values: tuple[str, ...] = ()
++
++    def read(self, state):
++        if state is None or state.state in ("unknown", "unavailable"):
++            return Value(self.kind, False)
++        value = state.state if self.attribute is None else state.attributes.get(self.attribute)
++        unit = state.attributes.get(self.unit_attribute, self.unit) if self.unit_attribute else self.unit
++        if self.kind == "boolean" and value in ("on", "off"):
++            value = value == "on"
++        valid = (
++            self.kind == "boolean" and isinstance(value, bool)
++            or self.kind in ("number", "temperature") and (
++                type(value) is int or isinstance(value, float) and isfinite(value)
++            )
++            or self.kind == "enum" and isinstance(value, str) and value in self.values
++        )
++        return Value(self.kind, True, value, unit) if valid else Value(self.kind, False)
++
++
++@dataclass(frozen=True)
++class Value:
++    kind: str
++    available: bool
++    value: bool | int | float | str | None = None
++    unit: str | None = None
++
++
++@dataclass(frozen=True)
++class Update:
++    screen: int
++    generation: int
++    sequence: int
++    snapshot: bool
++    fields: dict[int, Value]
++
++
++class ViewState:
++    """Create one per authorized BLE session. The verified carrier owns any writes."""
++
++    def __init__(self, screens, get_state, min_interval=0.25):
++        self._screens = {screen: tuple(fields) for screen, fields in screens.items()}
++        if any(not fields or len({f.id for f in fields}) != len(fields) or any(not 1 <= f.id <= 8 for f in fields)
++               for fields in self._screens.values()):
++            raise ValueError("A view supports one to eight uniquely numbered fields")
++        if not isfinite(min_interval) or min_interval < 0.25:
++            raise ValueError("State updates must be spaced at least 250 ms apart")
++        self._min_interval = min_interval
++        self._get_state = get_state
++        self._last_sent = float("-inf")
++        self.close()
++
++    def open(self, screen, generation):
++        """Replace the subscription. Its first update is always a full snapshot."""
++        if screen not in self._screens:
++            return False
++        self._view = (screen, generation)
++        self._sequence = -1
++        self._previous = None
++        self._dirty = True
++        self.entities = frozenset(field.entity_id for field in self._screens[screen])
++        return True
++
++    def close(self, screen=None, generation=None):
++        if screen is not None and self._view != (screen, generation):
++            return False
++        self._view = None
++        self._dirty = False
++        self._previous = None
++        self.entities = frozenset()
++        return True
++
++    def changed(self, entity_id):
++        if entity_id in self.entities:
++            self._dirty = True
++
++    def take(self, now):
++        """Coalesce changes and sample the latest values at send time."""
++        if not self._dirty or self._sequence == 0xFFFF or now < self._last_sent + self._min_interval:
++            return None
++        screen, generation = self._view
++        self._dirty = False
++        states = {entity: self._get_state(entity) for entity in self.entities}
++        reading = {field.id: field.read(states[field.entity_id]) for field in self._screens[screen]}
++        snapshot = self._previous is None
++        fields = reading.copy() if snapshot else {k: v for k, v in reading.items() if v != self._previous[k]}
++        self._previous = reading
++        if not snapshot and not fields:
++            return None
++        self._sequence += 1
++        self._last_sent = now
++        return Update(screen, generation, self._sequence, snapshot, fields)
++
+diff --git a/tests/test_handheld_climate.py b/tests/test_handheld_climate.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_handheld_climate.py
+@@ -0,0 +1,146 @@
++"""Verify state projection, the logical wire contract, and session isolation."""
++
++from struct import pack
++from tempfile import TemporaryDirectory
++from types import MethodType, SimpleNamespace
++import unittest
++from unittest.mock import AsyncMock
++
++from homeassistant.core import HomeAssistant
++
++from custom_components.ununiversal_remote.ble import BleRemote
++from custom_components.ununiversal_remote.remote import Remote
++from custom_components.ununiversal_remote.state_protocol import CLOSE, CONTROL_PREFIX, OPEN, StateSession
++from custom_components.ununiversal_remote.stock import STOCK_HANDHELD_MODE, STOCK_V1_MODE, decode_stock_event
++from custom_components.ununiversal_remote.view_state import Field
++
++
++def control(generation=0x12345678, *, kind=OPEN, screen=4):
++    return CONTROL_PREFIX + pack("<BBBI", kind, screen, 0, generation)
++
++
++class TestHandheldState(unittest.IsolatedAsyncioTestCase):
++    async def asyncSetUp(self):
++        test_dir = TemporaryDirectory()
++        self.addCleanup(test_dir.cleanup)
++        self.hass = HomeAssistant(test_dir.name)
++        entry = SimpleNamespace(entry_id="test", data={"remote_id": "test"}, options={
++            "ble_mode": STOCK_HANDHELD_MODE, "mqtt_enabled": False,
++        })
++        self.remote = Remote(self.hass, entry)
++        self.client = SimpleNamespace(is_connected=True)
++        self.activation = object()
++        self.ble = SimpleNamespace(client=self.client, active=self.activation)
++        self.ble.is_active = MethodType(BleRemote.is_active, self.ble)
++        self.remote.ble = self.ble
++        self.send = AsyncMock()
++        self.session = self.remote.make_state_session(self.client, self.activation, self.send)
++
++    async def test_exact_climate_snapshot_deltas_and_close(self):
++        self.hass.states.async_set("climate.home", "heat_cool", {
++            "current_temperature": 21.5, "temperature_unit": "°C", "target_temp_high": 70,
++        })
++        self.assertEqual(control().hex(" "), "7e 00 00 00 55 52 01 20 04 00 78 56 34 12")
++        self.assertIsNone(decode_stock_event(control(), STOCK_HANDHELD_MODE))
++        self.assertFalse(self.session.receive(control(screen=3)))
++        self.assertTrue(self.session.receive(control()))
++        self.assertFalse(self.session.receive(control()))
++        self.assertEqual(self.session.view.entities, {"climate.home"})
++        self.assertTrue(await self.session.flush(0))
++        self.send.assert_awaited_once_with(
++            self.client, bytes.fromhex("55 52 01 21 04 01 78 56 34 12 00 00 01 04 03 01 d7 00")
++        )
++        for value in (67, 68):
++            self.hass.states.async_set("climate.home", "heat_cool", {
++                "current_temperature": value, "temperature_unit": "°F", "target_temp_high": 70,
++            })
++            self.session.view.changed("climate.home")
++        self.assertFalse(await self.session.flush(0.24))
++        self.assertTrue(await self.session.flush(0.25))
++        self.send.assert_awaited_with(
++            self.client, bytes.fromhex("55 52 01 22 04 01 78 56 34 12 01 00 01 04 03 02 a8 02")
++        )
++        self.assertEqual(self.hass.states.get("climate.home").attributes["target_temp_high"], 70)
++        self.hass.states.async_set("climate.home", "unavailable", {"current_temperature": 68})
++        self.session.view.changed("climate.home")
++        self.assertTrue(await self.session.flush(0.5))
++        self.send.assert_awaited_with(
++            self.client, bytes.fromhex("55 52 01 22 04 01 78 56 34 12 02 00 01 00 00")
++        )
++        self.assertFalse(self.session.receive(control(0, kind=CLOSE)))
++        self.assertTrue(self.session.receive(control(kind=CLOSE)))
++        self.assertFalse(self.session.receive(control()))
++        self.assertFalse(self.session.view.entities)
++        self.assertFalse(await self.session.flush(1))
++
++    async def test_missing_invalid_and_signed_values(self):
++        for index, value in enumerate((None, True, "68", float("nan"), float("inf"), 10**500, 999.91, -1.25)):
++            with self.subTest(value=value):
++                if value is not None:
++                    self.hass.states.async_set("climate.home", "off", {
++                        "current_temperature": value, "temperature_unit": "°C",
++                    })
++                self.assertTrue(self.session.receive(control(index)))
++                self.assertTrue(await self.session.flush(index))
++                payload = b"\x01\x04\x03\x01\xf3\xff" if value == -1.25 else b"\x01\x00\x00"
++                self.send.assert_awaited_with(
++                    self.client, b"UR\x01" + pack("<BBBIH", 0x21, 4, 1, index, 0) + payload
++                )
++
++    async def test_bad_frames_and_reconnect_never_write_on_replacement(self):
++        old = control()
++        for malformed in (old[:-1], old + b"\0", old[:9] + b"\x01" + old[10:], old[:7] + b"\x01" + old[8:]):
++            self.assertFalse(self.session.receive(malformed))
++        self.remote.ble_mode = STOCK_V1_MODE
++        self.assertIsNone(self.remote.make_state_session(self.client, self.activation, self.send))
++        self.remote.ble_mode = STOCK_HANDHELD_MODE
++        self.assertIsNone(self.remote.make_state_session(self.client, None, self.send))
++        self.send.assert_not_awaited()
++        self.assertTrue(self.session.receive(old))
++        new_client = SimpleNamespace(is_connected=True)
++        new_activation = object()
++
++        async def reconnect(*_):
++            self.ble.client, self.ble.active = new_client, new_activation
++
++        self.send.side_effect = reconnect
++        self.assertFalse(await self.session.flush(1))
++        self.assertFalse(self.session.receive(old))
++        self.assertFalse(await self.session.flush(2))
++        self.send.assert_awaited_once_with(
++            self.client, bytes.fromhex("55 52 01 21 04 01 78 56 34 12 00 00 01 00 00")
++        )
++        self.send.side_effect = None
++        current = self.remote.make_state_session(new_client, new_activation, self.send)
++        self.assertFalse(await current.flush(2))
++        self.assertTrue(current.receive(control(0x12345679)))
++        self.assertTrue(await current.flush(2))
++        self.send.assert_awaited_with(
++            new_client, bytes.fromhex("55 52 01 21 04 01 79 56 34 12 00 00 01 00 00")
++        )
++
++    async def test_synthetic_entities_share_same_projection_and_delta_codec(self):
++        values = {}
++        screen = (
++            Field(1, "light.test", "boolean"),
++            Field(2, "cover.test", "number", "current_position", "%"),
++            Field(3, "cover.test", "enum", values=("closed", "closing", "opening", "open")),
++            Field(4, "fan.test", "number", "percentage", "%"),
++        )
++        values["light.test"] = SimpleNamespace(state="on", attributes={})
++        values["cover.test"] = SimpleNamespace(state="opening", attributes={"current_position": 75})
++        values["fan.test"] = SimpleNamespace(state="off", attributes={"percentage": 35})
++        session = StateSession(self.ble, self.client, self.activation, {5: screen}, values.get, self.send)
++        self.assertTrue(session.receive(control(0x1234567B, screen=5)))
++        self.assertTrue(await session.flush(0))
++        self.send.assert_awaited_with(self.client, bytes.fromhex(
++            "55 52 01 21 05 04 7b 56 34 12 00 00 01 01 01 01 02 02 02 4b 00 03 03 01 02 04 02 02 23 00"
++        ))
++        session.view.changed("climate.home")
++        self.assertFalse(await session.flush(0.25))
++        values["cover.test"].attributes["current_position"] = 60
++        session.view.changed("cover.test")
++        self.assertTrue(await session.flush(0.25))
++        self.send.assert_awaited_with(
++            self.client, bytes.fromhex("55 52 01 22 05 01 7b 56 34 12 01 00 02 02 02 3c 00")
++        )

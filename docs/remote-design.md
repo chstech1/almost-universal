@@ -6,7 +6,7 @@ Home Assistant owns activities, menus, and button mappings. The replacement firm
 
 1. Copy the repo’s `custom_components/ununiversal_remote` folder into your Home Assistant config directory under `custom_components`, then restart Home Assistant.
 2. In **Settings → Devices & services**, add **The Ununiversal Remote**. Give your remote an ID such as `living_room`. Use this ID in the MQTT client too.
-3. Open **Remote Menus** in the sidebar. The home screen, Activities, starts with TV in the first slot. On TV, use Lights, AC Control, Blinds, and Off. Assign your light to Lights, pick your thermostat on AC Control, and assign your shutdown script to Off. Off returns to Activities. Back on AC Control returns to TV.
+3. Open **Remote Menus** in the sidebar. **Home** displays **TV**, **Lights**, and **Temp** above soft keys A, B, and C. The fourth slot is blank. Each key opens its own activity screen, where soft key D shows **Back** and returns to Home. Device actions start unassigned.
 4. Try the draft in **Remote preview**, then save it. The preview follows navigation and shows the action that would run. Saved menus are kept in Home Assistant and restored on restart.
 
 Any binding can open a screen, run an action, or do both. The action choices include toggling a light or switch, running a Home Assistant script, activating a scene, or adjusting a thermostat. Bluetooth actions run in Home Assistant. Use a Home Assistant script for IR through an HA-managed blaster, or use the named IR command for the legacy MQTT simulator. A script can coordinate several devices.
@@ -18,9 +18,17 @@ Any binding can open a screen, run an action, or do both. The action choices inc
 
 </details>
 
-On AC Control, Channel changes the heat target and Volume changes the cool target. In heat/cool mode both targets are sent together. The display shows the state that the thermostat reports back, and each queued adjustment reads the confirmed state. In a single heat or cool mode, only the matching keys change its setpoint.
+On **Temp**, choose a thermostat before assigning temperature actions. You can map Channel to the heat target and Volume to the cool target. In heat/cool mode both targets are sent together. The display shows the state that the thermostat reports back, and each queued adjustment reads the confirmed state. In a single heat or cool mode, only the matching keys change its setpoint.
+
+## Preview the approved handheld menu
+
+Open the [offline handheld draft](../tools/handheld-menu-preview.html) from the checked-out repository, or use **Handheld draft** in a development copy of Remote Menus with the standard profile. The editor starts with the [approved Activities and TV layout](handheld-menu-spec.md). Edit titles, tile destinations, and Home Assistant targets. TV keys can use a Home Assistant script per command. Leave a TV shortcut label empty to hide its caption. **Download draft** saves these settings as a `handheld-draft-v1` JSON file.
+
+In Menu mode, the physical Back key restores the last screen and its focus. In TV mode, physical Back and Home preview TV commands, and D returns locally with or without the simulated link. The preview uses sample states. Draft JSON is for design review and firmware handoff. Saved remote menus, URM1 export, and the stock bench entry use their existing profiles.
 
 ## Connect a Bluetooth handheld
+
+This section covers the replacement-ARM URM1 service. For a spare with stock ARM v4.8 and a DSP prototype, use the [Stock ARM BLE setup and deployment guide](stock-arm-ble.md).
 
 1. Let Home Assistant discover the powered handheld using its Bluetooth integration. Use an existing connectable adapter or an active ESPHome Bluetooth proxy in range. [Home Assistant Bluetooth](https://www.home-assistant.io/integrations/bluetooth/) · [ESPHome Bluetooth proxy](https://esphome.io/components/bluetooth_proxy/)
 2. Open the discovered **The Ununiversal Remote** integration. Optionally select a switch in **First switch** to start with a one-button Home menu. On an existing integration, choose the handheld from **Configure**. Keep **Bluetooth off** to continue with the MQTT simulator alone.
@@ -47,27 +55,31 @@ python -m pip install paho-mqtt
 python tools/simulate_remote.py mqtt.example.local living_room --username your-user
 ```
 
-At the prompt enter `soft_1` to open TV and `soft_2` to open AC Control. Enter `channel_up 3` to send three presses, or `ready` to request the current screen. Navigation replies include the measured MQTT round trip in the terminal. With a TLS-enabled broker use `--tls` and optionally `--port`.
+At the prompt enter `soft_1`, `soft_2`, or `soft_3` from Home to open TV, Lights, or Temp. Enter `soft_4` from an activity to return Home, or `ready` to request the current screen. Navigation replies include the measured MQTT round trip in the terminal. With a TLS-enabled broker use `--tls` and optionally `--port`.
 
 All topics use the prefix `ununiversal_remote/<remote_id>/`. Use non-retained messages at QoS 0 and credentials scoped to the remote’s topics where the broker supports it.
 
 | Topic suffix | Publisher | JSON example |
 | --- | --- | --- |
 | `ready` | Remote | `{}` |
-| `press` | Remote | `{"screen_id":"tv","screen_token":"ec5pizcYLrI","button_id":"soft_2"}` |
-| `screen` | Home Assistant | `{"screen_id":"ac","screen_token":"sNqcF6A8cdw","title":"AC Control","text":"Room 72°F\nHeat 68°F\nCool 74°F","buttons":{"soft_4":"Back"}}` |
+| `press` | Remote | `{"screen_id":"home","screen_token":"ec5pizcYLrI","button_id":"soft_3"}` |
+| `screen` | Home Assistant | `{"screen_id":"temp","screen_token":"sNqcF6A8cdw","title":"Temp","text":"Room 72°F\nHeat 68°F\nCool 74°F","buttons":{"soft_4":"Back"}}` |
 | `ir` | Home Assistant | `{"command_id":"tv_power_off"}` |
 
 Subscribe to `screen` and `ir` before sending `ready` on wake or reconnect. Each press carries the screen ID and token that were displayed at the time. Use `soft_1` through `soft_4`, `channel_up`, `channel_down`, `volume_up`, or `volume_down`. Blank shortcut slots stay empty. Keep the token with the screen. Navigation and saving generate a new token, and text updates reuse it. Home Assistant responds to a stale press with the current screen. The handheld can map IR command IDs to its locally stored codes when its IR path is ready.
 
 ## Verify the implementation
 
-On a test Home Assistant server, assign the sample Off mapping to a test script and confirm it runs from a live MQTT press. Check that the preview reports the script without running it, and that a rapid burst of Channel presses moves the heat target without changing the cool target. Test a reconnect and confirm that menus survive a Home Assistant restart.
+On a test Home Assistant server, assign a spare soft key on TV to a test script and confirm it runs from a live MQTT press. Check that the preview reports the script without running it. On Temp, assign the thermostat and heat actions, then verify that a rapid burst of Channel presses moves the heat target without changing the cool target. Test a reconnect and confirm that menus survive a Home Assistant restart.
 
-Run the menu regression tests from a Python environment with Home Assistant installed and a C compiler on the path. The Bluetooth tests compile the handheld's key sampler and menu runtime, then feed their actual notifications through the production Home Assistant dispatcher with a simulated switch.
+Run the regression tests from the repository root. The Home Assistant tests used Core 2026.11.2, Python 3.14.3, and a host C compiler on the path. The Bluetooth tests compile the handheld's key sampler and menu runtime, then feed their notifications through the production Home Assistant dispatcher with a simulated switch.
 
 ```sh
+python3.14 -m venv .venv
+source .venv/bin/activate
+python -m pip install 'homeassistant==2026.11.2'
 python -m unittest discover -s tests -v
+python -m unittest -v test_worws_ota
 ```
 
-The next hardware milestone tests discovery and the one-button switch action through an existing adapter or active proxy. Measure button-to-display latency on the handheld, aiming for under 150 ms at the 95th percentile while connected. Measure the first press after sleep separately.
+The stock-ARM Office bindings passed an initial hardware test. Repeat the key checks after a firmware update or reconnect. Measure button-to-display latency on the handheld, aiming for under 150 ms at the 95th percentile while connected. Measure the first press after sleep separately. [November 20 hardware results](progress-2026-11-20.md#verified-on-the-v06-spare)

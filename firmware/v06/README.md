@@ -6,7 +6,7 @@ This ARM application reads the W4600000 V06 controls, displays a menu from Home 
 
 A user with compatible firmware would install the integration, accept the discovered handheld in Home Assistant and choose a switch. An existing local Bluetooth adapter or active ESPHome Bluetooth proxy can supply the connection. A new setup then shows **Toggle** over the first physical key. Press A once to toggle and again to toggle back. On an existing setup, bind soft key A on a test screen to **Toggle switch** for the **Press** event. [Integration setup](../../docs/remote-design.md)
 
-This is a development ARM image. Physical boot, radio discovery, the screen, key timing, board power and independent recovery of the replacement ARM firmware on V06 still require verification. The successful Bluetooth rollback of the stock-based DSP label test used the original ARM updater. This application provides a Home Assistant service and currently has no retail OTA recovery service. The deliverable is a raw ARM member and debug ELF for development.
+This is a development ARM image. Physical boot, radio discovery, the screen, key timing, board power and independent recovery of the replacement ARM firmware on V06 still require verification. The successful stock rollback used the original ARM updater. This application provides a Home Assistant service and omits the retail OTA recovery service. The deliverable is a raw ARM member and debug ELF for development. The current bench path uses the stock v4.8 ARM and an edited DSP. [Tested firmware and recovery path](../../docs/firmware.md#replacement-arm-prototype)
 
 ## Rebuild and test offline
 

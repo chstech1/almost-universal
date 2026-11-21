@@ -1,0 +1,465 @@
+--- a/firmware/dsp-v48-native-menu/build.py
++++ b/firmware/dsp-v48-native-menu/build.py
+@@ -1,6 +1,7 @@
+-"""QEMU-only v4.8 retirement and full-frame splash proof. Never opens hardware."""
++"""Build the offline Office-controls DSP against the exact working stock-operations image."""
+ 
+ import argparse
++import re
+ from hashlib import sha256
+ from pathlib import Path
+ from struct import pack, pack_into, unpack_from
+@@ -26,6 +27,8 @@
+ STOCK_DSP_SHA = "72ff3017d07537e000925babafc5f27ed1b9c0e0fe9d52cdac819e1b677adb45"
+ COLOR_ZIP_SHA = "c48f06501cc8e3d317fe3c8ae56c580558b39e5b7c826fd59eb5dd16fc7a01ab"
+ COLOR_DSP_SHA = "f15dcc1866ef59610c81489211dff0ec58c646fe17e8fb05135f96afabe6093c"
++WORKING_ZIP_SHA = "9e2c5dfd15a6376a1d2b16754db5942615dd838d366fdcf23e472b91846407a4"
++WORKING_DSP_SHA = "a2ab84a42622850d866f86ab26825e5eea0fd94a6514d1ce1bafffde05d2645e"
+ 
+ SLOTS = {
+     "retired_audio": (0x271A4, 0x27405),
+@@ -106,7 +109,7 @@
+         layout.extend(f"{name} = {BASE + offset:#x};" for name, offset in CALLS.items())
+     layout.append("SECTIONS {")
+     layout.extend(f"  .{name} {SIM + address:#x} : {{ *(.{name}) }}" for name, address in sections)
+-    layout.extend(f"  .{name} {base + start:#x} : {{ handheld.o(.{name}) }}"
++    layout.extend(f"  .{name} {base + start:#x} : {{ handheld.o(.{name} .{name}.art) }}"
+                   for name, (start, _) in SLOTS.items())
+     layout.append(f"  .extension {base + FACTORY_ENTRY + 4:#x} : {{ handheld.o(.literal* .text* .rodata*) }}")
+     if fixture:
+@@ -176,10 +179,15 @@
+     candidate[offset:offset + 3] = instruction.to_bytes(3, "little")
+ 
+ 
+-def build(prefix, work, stock, reference):
++def build(prefix, work, stock, reference, working):
+     verify_retirements(stock, reference)
+     compile_c(prefix, work, "handheld")
+     symbols = link(prefix, work)
++    instructions = run([f"{prefix}-objdump", "-d", "menu.elf"], cwd=work, check=True,
++                       capture_output=True, text=True).stdout
++    require(not re.search(r"^[ 	]*[0-9a-f]+:[ 	]+[0-9a-f]+[ 	]+(?:mul16[us]|mull|quou|quos|remu|rems)\b",
++                          instructions, re.M),
++            "A multiply or divide instruction outside the verified core sequence was emitted")
+     candidate = bytearray(reference)
+     for name, offset in (("native_menu_create", SET_TEXT_CALL), ("handheld_report", REPORT_CALL)):
+         require(candidate[offset] & 0x3f == 0x25, f"Expected pinned call8 at {offset:#x}")
+@@ -217,6 +225,15 @@
+         require(all(any(site in region for region in changed)
+                     for site in references(candidate, start, end)),
+                 "Stale reference to retired function interior outside approved patch sites")
++
++    working_changes = [range(start, end) for start, end in regions.values()]
++    working_changes.extend(range(offset, offset + 3) for offset in (SET_TEXT_CALL, REPORT_CALL, FRESH_CALL))
++    working_changes.extend(range(slot, slot + 4) for slot, _, _, _, _ in RETIRED_PAGES.values())
++    require(len(working) == len(candidate) and
++            all(old == new or any(i in region for region in working_changes)
++                for i, (old, new) in enumerate(zip(working, candidate))),
++            "Unexpected difference outside the working image's existing repurposed regions and callbacks")
++    print("Working-image diff verified. No widened flash span or newly retired stock region.")
+     return candidate, symbols
+ 
+ 
+@@ -284,9 +301,9 @@
+     status = run(["qemu-system-xtensa", "-M", "sim", "-cpu", "de212", "-m", "16M", "-display", "none",
+                   "-monitor", "none", "-serial", "none", "-semihosting",
+                   "-device", "loader,file=menu.elf,cpu-num=0"], cwd=work, timeout=10)
+-    require(not status.returncode, f"Xtensa fixture stopped at line modulo 256 = {status.returncode}")
+-    print("Xtensa fixture passed: exact indexed frame, splash lifetime and keys, factory/Audio/Fan and shell,"
+-          " stock flush, Activities/TV navigation and packets, and Climate labels")
++    require(not status.returncode, f"Xtensa fixture stopped with assertion code {status.returncode}")
++    print("Xtensa fixture passed: exact indexed splash, first-frame and input checks, stock flush,"
++          " Office labels/Back and all action packets, TV compatibility and Climate readout")
+ 
+ 
+ def load(path, zip_hash, dsp_hash, *, only_dsp=False):
+@@ -303,6 +320,7 @@
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("color_baseline", type=Path)
+     parser.add_argument("stock_v48", type=Path)
++    parser.add_argument("working_stock_ops", type=Path)
+     parser.add_argument("approved_png", type=Path)
+     parser.add_argument("--tool-prefix", default="xtensa-esp32-elf")
+     parser.add_argument("--output", type=Path, help="optional new .OFFLINE.zip after successful QEMU")
+@@ -312,10 +330,11 @@
+     prefix = str(Path(args.tool_prefix).expanduser().resolve()) if "/" in args.tool_prefix else args.tool_prefix
+     stock = load(args.stock_v48, STOCK_ARCHIVE_SHA, STOCK_DSP_SHA)
+     reference = load(args.color_baseline, COLOR_ZIP_SHA, COLOR_DSP_SHA, only_dsp=True)
++    working = load(args.working_stock_ops, WORKING_ZIP_SHA, WORKING_DSP_SHA, only_dsp=True)
+     with TemporaryDirectory(prefix="full-splash-proof-") as directory:
+         work = Path(directory)
+         prepare(args.approved_png, work)
+-        candidate, symbols = build(prefix, work, stock, reference)
++        candidate, symbols = build(prefix, work, stock, reference, working)
+         run([f"{prefix}-size", "-A", "handheld.o"], cwd=work, check=True)
+         print((work / "handheld.su").read_text(), flush=True)
+         smoke(prefix, work, candidate, symbols)
+--- a/firmware/dsp-v48-native-menu/encode_full_splash.py
++++ b/firmware/dsp-v48-native-menu/encode_full_splash.py
+@@ -107,7 +107,7 @@
+     if canvas != original:
+         raise SystemExit("The decoded crops and navy matte differ from the approved frame")
+     header.append("static const struct packed_crop splash_crops[] = {")
+-    header.extend(f"    {{splash_crop_{i}, sizeof splash_crop_{i}, {x}, {y}, {w}, {h}}},"
++    header.extend(f"    {{splash_crop_{i}, sizeof splash_crop_{i}, {x}, {y}, {w}, {h}, {w*h}}},"
+                   for i, (x, y, w, h) in enumerate(CROPS))
+     header.append("};")
+     (work / "splash_packed.inc").write_text("\n".join(header) + "\n")
+--- a/firmware/dsp-v48-native-menu/handheld.c
++++ b/firmware/dsp-v48-native-menu/handheld.c
+@@ -2,13 +2,20 @@
+ #include "splash.h"
+ #include <stdbool.h>
+ 
+-enum control { D = 4, LEFT = 7, RIGHT, UP, DOWN, OK, BACK };
++enum control { A = 1, C = 3, D = 4, LEFT = 7, RIGHT, UP, DOWN, OK, BACK };
+ 
+ enum view {
+-    ACTIVITIES, ROOM, SCENES, LIGHTS, CLIMATE, BLINDS, TV,
+-};
+-
+-enum { TV_WIRE_SCREEN = 3, STOCK_POWER_KEYS = 0x4050 };
++    ACTIVITIES, ROOM, SCENES, LIGHTS, CLIMATE, BLINDS, TV, COVERS, CURTAINS, FAN,
++};
++
++enum { STOCK_POWER_KEYS = 0x4050 };
++static const uint8_t wire_screen[] = {
++    [TV] = 3, [LIGHTS] = 5, [BLINDS] = 6, [CURTAINS] = 7, [FAN] = 8,
++};
++
++static const char *const tv_captions[] = {"A\nInput", "B\nGuide", "C\nMenu", "D\nBack"};
++static const char *const toggle_captions[] = {"A\nToggle", NULL, NULL, "D\nBack"};
++static const char *const cover_captions[] = {"A\nOpen", "B\nClose", "C\nStop", "D\nBack"};
+ 
+ struct screen {
+     const char *title;
+@@ -20,20 +27,22 @@
+ 
+ static const char *const tiles[] = {
+     "Watch TV", "Room\ncontrols", "Scenes",
+-    "Lights", "Climate", "Blinds",
++    "Lights", "Climate", "Covers", "\xef\x80\x93\nFan",
+     "Movie night", "Evening",
+-    "Turn on", "Turn off",
+-    "Open", "Close", "Stop",
++    "Blinds", "Curtains",
+ };
+ 
+ static const struct screen screens[] = {
+     [ACTIVITIES] = {"Activities", 0, 3, ACTIVITIES, 0},
+-    [ROOM] = {"Room controls", 3, 3, ACTIVITIES, 1},
+-    [SCENES] = {"Scenes", 6, 2, ACTIVITIES, 2},
+-    [LIGHTS] = {"Lights", 8, 2, ROOM, 0},
++    [ROOM] = {"Room controls", 3, 4, ACTIVITIES, 1},
++    [SCENES] = {"Scenes", 7, 2, ACTIVITIES, 2},
++    [LIGHTS] = {"Lights", 0, 0, ROOM, 0},
+     [CLIMATE] = {"Climate", 0, 0, ROOM, 1},
+-    [BLINDS] = {"Blinds", 10, 3, ROOM, 2},
++    [BLINDS] = {"Blinds", 0, 0, COVERS, 0},
+     [TV] = {"Watch TV", 0, 0, ACTIVITIES, 0},
++    [COVERS] = {"Covers", 9, 2, ROOM, 2},
++    [CURTAINS] = {"Curtains", 0, 0, COVERS, 1},
++    [FAN] = {"Fan", 0, 0, ROOM, 3},
+ };
+ 
+ struct input_report {
+@@ -134,6 +143,7 @@
+     const uint8_t *stream;
+     uint16_t stream_size;
+     uint8_t x, y, width, height;
++    uint16_t pixel_area;
+ };
+ 
+ #include "splash_packed.inc"
+@@ -194,8 +204,9 @@
+         void *image = stock_get_child(container, FIRST_MARK_CHILD + i);
+         if (!image)
+             break;
+-        if (view <= SCENES && i < screens[view].count) {
+-            unsigned mark = 2 * (3 * view + i) + (i == handheld_state.focus);
++        if ((view <= SCENES || view == COVERS) && i < screens[view].count) {
++            unsigned shape = view == COVERS ? 5 : 3 * view + i;
++            unsigned mark = 2 * shape + (i == handheld_state.focus);
+             stock_image_set_source(image, &marks[mark]);
+             int y = i < 2 ? 112 : (view == ACTIVITIES ? 186 : 179);
+             stock_set_position(image, 23 + (i % 2) * 109, y);
+@@ -224,43 +235,45 @@
+     unsigned view = handheld_state.view;
+     const struct screen *screen = &screens[view];
+     bool tv = view == TV;
++    bool device = wire_screen[view] != 0;
+     place(title, screen->title, 14, TITLE_Y, 212, TITLE_HEIGHT);
+-    place(mode, tv ? "TV mode" : "Menu mode", 14, MODE_Y, 212, 22);
++    place(mode, tv ? "TV mode" : device ? "Device mode" : "Menu mode", 14, MODE_Y, 212, 22);
+     bool climate = view == CLIMATE;
+     if (tv)
+         place(feedback, "Hard Back and Home\nstay in TV mode", 14, 189, 212, 36);
+     else if (climate)
+         place(feedback, "No reading yet", 14, 159, 212, 21);
+-    else if (!tv && view >= SCENES)
++    else if (view == SCENES)
+         place(feedback, "Set up in Home Assistant", 14, 253, 212, 21);
+     else
+         stock_add_flag(feedback, HIDDEN);
+ 
+-    static const char *const captions[4] = {"A\nInput", "B\nGuide", "C\nMenu", "D\nBack"};
++    const char *const *captions = tv ? tv_captions :
++                                  (view == LIGHTS || view == FAN ? toggle_captions : cover_captions);
+     for (unsigned i = 0; i < 4; ++i) {
+         struct stock_label *slot = stock_get_child(container, FIRST_SLOT_CHILD + i);
+         if (!slot)
+             break;
+-        if (!tv && i >= (climate ? 2 : screen->count)) {
++        if (device ? !captions[i] : i >= (climate ? 2 : screen->count)) {
+             stock_add_flag(slot, HIDDEN);
+             continue;
+         }
+-        bool focused = !climate && !tv && i == handheld_state.focus;
+-        bool artwork = view <= SCENES;
++        bool focused = !climate && !device && i == handheld_state.focus;
++        bool artwork = view <= SCENES || view == COVERS;
+         stock_text_align(slot, climate || artwork ? LEFT_ALIGN : CENTER_ALIGN, MAIN);
+         stock_bg_color(slot, climate ? PANEL : focused ? FOCUS : TILE, MAIN);
+         stock_text_color(slot, climate && !i ? SECONDARY : focused ? FOCUS_TEXT : PRIMARY, MAIN);
+         bool activities = view == ACTIVITIES;
+         stock_pad_left(slot, artwork ? 9 : 0, MAIN);
+-        stock_pad_top(slot, climate ? 0 : tv ? 7 : artwork ? 28 : TILE_PAD_TOP, MAIN);
+-        stock_radius(slot, tv || climate ? 0 : TILE_RADIUS, MAIN);
++        stock_pad_top(slot, climate ? 0 : device ? 7 : i == 3 ? 11 : 28, MAIN);
++        stock_radius(slot, device || climate ? 0 : TILE_RADIUS, MAIN);
+         if (climate)
+             place(slot, i ? "--" : "Current temperature", 14, i ? 132 : 105, 212, 20);
+-        else if (tv)
++        else if (device)
+             place(slot, captions[i], 60 * i + CAPTION_INSET, 274, CAPTION_WIDTH, 46);
+         else
+             place(slot, tiles[screen->first_tile + i], 14 + (i % 2) * 109,
+-                  GRID_Y + (i / 2) * (activities ? 74 : ROW_PITCH),
++                  i < 2 ? GRID_Y : GRID_Y + (activities ? 74 : ROW_PITCH),
+                   103, activities && i < 2 ? 68 : TILE_HEIGHT);
+     }
+     draw_decoration(container, view);
+@@ -405,7 +418,7 @@
+ __attribute__((noinline, section(".retired_fan")))
+ static bool add_splash_crop(void *container, const struct packed_crop *crop)
+ {
+-    size_t pixel_size = (size_t)crop->width * crop->height / 4;
++    size_t pixel_size = crop->pixel_area / 4;
+     struct image_desc *source = stock_lv_alloc(sizeof *source + sizeof splash_palette + pixel_size);
+     if (!source)
+         return false;
+@@ -632,10 +645,11 @@
+     }
+ }
+ 
+-static __attribute__((noinline)) void send_tv(unsigned control, const uint8_t timestamp[4])
++static __attribute__((noinline)) void send_press(unsigned screen, unsigned control,
++                                               const uint8_t timestamp[4])
+ {
+     uint8_t payload[0x302] __attribute__((aligned(4))) = {
+-        11, 0, 0x7e, 'U', 'R', 1, 1, TV_WIRE_SCREEN, control,
++        11, 0, 0x7e, 'U', 'R', 1, 1, screen, control,
+         timestamp[0], timestamp[1], timestamp[2], timestamp[3]
+     };
+     stock_ipc_send(19, payload, sizeof payload);
+@@ -662,17 +676,19 @@
+     unsigned view = handheld_state.view;
+     const struct screen *screen = &screens[view];
+     handheld_state.transition_key = 0;
+-    if (view == TV) {
+-        if (key == D)
++    unsigned source = wire_screen[view];
++    if (source) {
++        if (key == D || (view != TV && key == BACK))
+             open_view(label, screen->parent, screen->parent_focus);
+-        else
+-            send_tv(key, report->timestamp);
++        else if (view == TV || key <= (view == LIGHTS || view == FAN ? A : C))
++            send_press(source, key, report->timestamp);
+     } else if (key == BACK && view != ACTIVITIES) {
+         open_view(label, screen->parent, screen->parent_focus);
+     } else if (key == OK) {
+-        static const uint8_t destinations[2][3] = {{TV, ROOM, SCENES}, {LIGHTS, CLIMATE, BLINDS}};
+-        if (view == ACTIVITIES || view == ROOM)
+-            open_view(label, destinations[view][handheld_state.focus], 0);
++        static const uint8_t destinations[] = {TV, ROOM, SCENES, LIGHTS, CLIMATE, COVERS, FAN,
++                                                0, 0, BLINDS, CURTAINS};
++        if (view == ACTIVITIES || view == ROOM || view == COVERS)
++            open_view(label, destinations[screen->first_tile + handheld_state.focus], 0);
+     } else {
+         move_focus(label, key, screen->count);
+     }
+--- a/firmware/dsp-v48-native-menu/proof_marks.inc
++++ b/firmware/dsp-v48-native-menu/proof_marks.inc
+@@ -52,21 +52,21 @@
+     0x00, 0x00, 0x00, 0x00, 0x15, 0x54, 0x00, 0x00, 0x00, 0x00, 0x15, 0x54, 0x00, 0x00, 0x00, 0x00,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+ };
+-static const uint8_t nested_mark_0[] = {
++static const uint8_t nested_mark_0[] __attribute__((section(".retired_fan.art"))) = {
+     0x18, 0x20, 0x18, 0xff, 0xac, 0xb6, 0xac, 0xff, 0xac, 0xb6, 0xac, 0xff, 0xac, 0xb6, 0xac, 0xff,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x15, 0x54, 0x00, 0x00, 0x50, 0x05, 0x00,
+     0x00, 0x40, 0x01, 0x00, 0x01, 0x40, 0x01, 0x40, 0x01, 0x40, 0x01, 0x40, 0x00, 0x40, 0x01, 0x00,
+     0x00, 0x50, 0x05, 0x00, 0x00, 0x15, 0x54, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x05, 0x50, 0x00,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00,
+ };
+-static const uint8_t nested_mark_1[] = {
++static const uint8_t nested_mark_1[] __attribute__((section(".retired_fan.art"))) = {
+     0x94, 0xee, 0xd5, 0xff, 0x10, 0x24, 0x18, 0xff, 0x10, 0x24, 0x18, 0xff, 0x10, 0x24, 0x18, 0xff,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x15, 0x54, 0x00, 0x00, 0x50, 0x05, 0x00,
+     0x00, 0x40, 0x01, 0x00, 0x01, 0x40, 0x01, 0x40, 0x01, 0x40, 0x01, 0x40, 0x00, 0x40, 0x01, 0x00,
+     0x00, 0x50, 0x05, 0x00, 0x00, 0x15, 0x54, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x05, 0x50, 0x00,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00,
+ };
+-static const uint8_t nested_mark_2[] = {
++static const uint8_t nested_mark_2[] __attribute__((section(".retired_fan.art"))) = {
+     0x18, 0x20, 0x18, 0xff, 0xac, 0xb6, 0xac, 0xff, 0xac, 0xb6, 0xac, 0xff, 0xac, 0xb6, 0xac, 0xff,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x04, 0x10, 0x00, 0x00, 0x04, 0x10, 0x00,
+     0x00, 0x04, 0x10, 0x00, 0x00, 0x04, 0x10, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x05, 0x50, 0x00,
+--- a/firmware/dsp-v48-native-menu/smoke.c
++++ b/firmware/dsp-v48-native-menu/smoke.c
+@@ -4,7 +4,7 @@
+ #include "splash.h"
+ #endif
+ 
+-#define CHECK(condition) do { if (!(condition)) return __LINE__; } while (0)
++#define CHECK(condition) do { if (!(condition)) return 1 + __LINE__ % 255; } while (0)
+ 
+ #ifdef ACTION
+ #define CONTROLS_CAPTION "Controls\n\nA: Action\nD: Back"
+@@ -754,6 +754,100 @@
+     fail_at = alloc_attempts = 0;
+ }
+ 
++static int check_office_controls(void)
++{
++    struct layout_label *title = &layout_labels[0];
++    struct layout_label *mode = &layout_labels[1];
++    struct layout_label *slots = &layout_labels[3];
++    unsigned events = sent;
++
++    /* Start at Activities with Scenes focused. Enter Room controls, then Lights. */
++    press(0x20, 100);
++    press(0x80, 101);
++    press(0x200, 102);
++    CHECK(equal(title->text, "Room controls"));
++    press(0x200, 103);
++    CHECK(equal(title->text, "Lights") && equal(mode->text, "Device mode") && sent == events);
++    CHECK(equal(slots[0].text, "A\nToggle") && geometry(&slots[0], 1, 274, 58, 46) &&
++          slots[1].hidden && slots[2].hidden && equal(slots[3].text, "D\nBack"));
++
++    /* Entry, its repeat and release, blank slots, wheel, chord and other keys are inert. */
++    press(0x200, 104);
++    raw_report(10, 0x200, 2, 0, 105);
++    raw_report(10, 0, 0, 0, 106);
++    press(2, 107);
++    press(4, 108);
++    press(3, 109);
++    press(0x1000, 110);
++    raw_report(10, 1, 1, 1, 111);
++    CHECK(sent == events);
++    press(1, 0x12345678);
++    CHECK(sent == ++events && match_frame(5, 1, 0x12345678));
++    raw_report(10, 1, 2, 0, 112);
++    raw_report(10, 1, 0, 0, 113);
++    press(1, 114);
++    CHECK(sent == ++events && match_frame(5, 1, 114));
++
++    unsigned delegates = normalized;
++    press(0x10, 115);
++    press(0x40, 116);
++    press(0x4000, 117);
++    press(0x4001, 118);
++    active_page = "charge";
++    press(1, 119);
++    active_page = stock_nodev_name;
++    CHECK(normalized == delegates + 5 && sent == events);
++    press(0x400, 120); /* Physical Back is local in Office. */
++    CHECK(sent == events && equal(title->text, "Room controls") &&
++          color_matches(slots[0].bg, 0xd772));
++
++    press(0x2000, 121);
++    CHECK(equal(slots[2].text, "Covers") && color_matches(slots[2].bg, 0xd772));
++    press(0x200, 122);
++    CHECK(sent == events && equal(title->text, "Covers") && equal(mode->text, "Menu mode") &&
++          equal(slots[0].text, "Blinds") && equal(slots[1].text, "Curtains"));
++    for (unsigned i = 0; i < 2; ++i) {
++        if (i)
++            press(0x80, 123);
++        press(0x200, 124);
++        CHECK(equal(title->text, i ? "Curtains" : "Blinds") && equal(mode->text, "Device mode"));
++        CHECK(equal(slots[0].text, "A\nOpen") && equal(slots[1].text, "B\nClose") &&
++              equal(slots[2].text, "C\nStop") && equal(slots[3].text, "D\nBack"));
++        raw_report(10, 0x200, 2, 0, 125);
++        raw_report(10, 0, 0, 0, 126);
++        CHECK(sent == events);
++        for (unsigned key = 1; key <= 3; ++key) {
++            unsigned mask = 1u << (key - 1);
++            uint32_t timestamp = 0x10203040 + 3 * i + key;
++            press(mask, timestamp);
++            CHECK(sent == ++events && match_frame(6 + i, key, timestamp));
++            raw_report(10, mask, 2, 0, 127);
++            raw_report(10, mask, 0, 0, 128);
++        }
++        press(8, 129);
++        CHECK(sent == events && equal(title->text, "Covers") && color_matches(slots[i].bg, 0xd772));
++    }
++    press(0x400, 130);
++    CHECK(equal(title->text, "Room controls") && color_matches(slots[2].bg, 0xd772));
++
++    press(0x80, 131);
++    press(0x200, 132);
++    CHECK(sent == events && equal(title->text, "Fan") && equal(mode->text, "Device mode"));
++    CHECK(equal(slots[0].text, "A\nToggle") && slots[1].hidden && slots[2].hidden);
++    press(1, 0xf0e0d0c0);
++    CHECK(sent == ++events && match_frame(8, 1, 0xf0e0d0c0));
++    raw_report(10, 1, 2, 0, 133);
++    press(2, 134);
++    press(4, 135);
++    press(8, 136);
++    CHECK(sent == events && equal(title->text, "Room controls") &&
++          color_matches(slots[3].bg, 0xd772));
++    press(0x400, 137);
++    CHECK(sent == events && equal(title->text, "Activities") &&
++          color_matches(slots[1].bg, 0xd772) && errors == 0);
++    return 0;
++}
++
+ static int smoke_handheld(void)
+ {
+     int checked = check_retired_pages();
+@@ -886,7 +980,9 @@
+     press(1, 52);
+     CHECK(changes == drawings && sent == 0);
+     press(0x400, 6);
+-    CHECK(equal(title->text, "Room controls") && color_matches(slots[1].bg, 0xd772) && slots[3].hidden);
++    CHECK(equal(title->text, "Room controls") && color_matches(slots[1].bg, 0xd772));
++    CHECK(equal(slots[2].text, "Covers") && equal(slots[3].text, "\xef\x80\x93\nFan") &&
++          geometry(&slots[3], 123, 171, 103, 61));
+     climate_render_value("68.0\xc2\xb0" "F", false);
+     CHECK(equal(slots[1].text, "Climate"));
+     press(0x400, 7);
+@@ -922,6 +1018,12 @@
+     CHECK(sent == 2 && match_frame(3, 12, 14) && equal(mode->text, "TV mode"));
+     press(0x800, 15);  /* Hard Home stays in TV mode. */
+     CHECK(sent == 3 && match_frame(3, 13, 15) && equal(mode->text, "TV mode"));
++    press(0x1000, 60);  /* Existing stock TV Volume + */
++    CHECK(sent == 4 && match_frame(3, 16, 60));
++    press(0x10000, 61); /* Existing stock TV Volume - */
++    CHECK(sent == 5 && match_frame(3, 17, 61));
++    press(0x20000, 62); /* Existing stock TV Mute */
++    CHECK(sent == 6 && match_frame(3, 15, 62));
+     press(8, 16);      /* D returns locally and restores the Watch TV tile. */
+     CHECK(equal(title->text, "Activities") && equal(mode->text, "Menu mode"));
+     CHECK(geometry(&slots[0], 14, RowOne, 103, 68) &&
+@@ -933,8 +1035,8 @@
+           !layout_labels[FirstMark+1].hidden && layout_labels[FirstMark+2].hidden);
+     press(0x400, 19);
+     CHECK(equal(title->text, "Activities") && color_matches(slots[2].bg, 0xd772));
+-    CHECK(sent == 3 && errors == 0);
+-    return 0;
++    CHECK(sent == 6 && errors == 0);
++    return check_office_controls();
+ }
+ #else
+ static int smoke_handheld(void)

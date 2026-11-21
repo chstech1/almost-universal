@@ -1,0 +1,137 @@
+--- a/firmware/dsp-v48-native-menu/build.py
++++ b/firmware/dsp-v48-native-menu/build.py
+@@ -29,6 +29,12 @@
+ COMBINED_DSP_SHA = "3b303cc650d69f0016484c14742c06a7b1b31459ff9e34ca257b09dbe082ae2a"
+ SPLASH_GATE, MENU_FALLBACK = 0x2B0EB, 0x2B14A
+ SPLASH_GATE_BYTES = bytes.fromhex("56b805")
++CROP_TABLE = 0x2BAE0
++CROP_DIMENSIONS = ((88, 145), (160, 28), (200, 27))
++STOCK_OPS = {
++    0x2CA38: (bytes.fromhex("8066c1"), bytes.fromhex("621305")),  # l16ui a6, a3, 10
++    0x2AC13: (bytes.fromhex("80ddc1"), bytes.fromhex("d0d893")),  # movnez a13, a8, a13
++}
+ 
+ SLOTS = {
+     "retired_audio": (0x271A4, 0x27405),
+@@ -231,7 +237,36 @@
+     payload[offset:offset + 3] = (0x06 | (displacement << 6)).to_bytes(3, "little")
+ 
+ 
+-def smoke(prefix, work, candidate, symbols, *, bypass=False):
++def use_stock_ops(payload, base):
++    """Keep all links fixed and replace the two unverified scalar multiply opcodes."""
++    for site, (before, after) in STOCK_OPS.items():
++        at = site - base
++        if 0 <= at <= len(payload) - 3:
++            require(payload[at:at + 3] == before, f"Unexpected instruction at {site:#x}")
++            payload[at:at + 3] = after
++    table = CROP_TABLE - base
++    if 0 <= table <= len(payload) - 36:
++        for i, (width, height) in enumerate(CROP_DIMENSIONS):
++            at = table + 12 * i + 8
++            require(tuple(payload[at:at + 4]) == (width, height, 0, 0),
++                    "Unexpected crop dimensions or record padding")
++            pack_into("<H", payload, at + 2, width * height)
++
++
++def read_fixture_section(prefix, work, name):
++    section = work / f"fixture-{name}.bin"
++    run([f"{prefix}-objcopy", "--dump-section", f".{name}={section}", "menu.elf"],
++        cwd=work, check=True)
++    return section, bytearray(section.read_bytes())
++
++
++def write_fixture_section(prefix, work, name, section, data):
++    section.write_bytes(data)
++    run([f"{prefix}-objcopy", "--update-section", f".{name}={section}", "menu.elf"],
++        cwd=work, check=True)
++
++
++def smoke(prefix, work, candidate, symbols, *, bypass=False, stock_ops=False):
+     def rebase(data):
+         return b"".join(pack("<I", address - BASE + SIM) for (address,) in
+                         ((unpack_from("<I", data, j)[0],) for j in range(0, len(data), 4)))
+@@ -292,19 +327,27 @@
+     for name in ("native_menu_create", "handheld_report", "splash_first_press", "factory_compact",
+                  "audio_notice", "fan_notice", "climate_render_value", "unpack_splash"):
+         require(test_symbols[name] - SIM == symbols[name] - BASE, f"Fixture changed address of {name}")
+-    if bypass:
+-        # Execute the exact branch bytes in the rebased original extension.
+-        section = work / "fixture-extension.bin"
+-        run([f"{prefix}-objcopy", "--dump-section", f".extension={section}", "menu.elf"],
+-            cwd=work, check=True)
+-        data = bytearray(section.read_bytes())
+-        at = SPLASH_GATE - (FACTORY_ENTRY + 4)
+-        bypass_gate(data, at)
+-        require(data[at:at + 3] == candidate[SPLASH_GATE:SPLASH_GATE + 3],
+-                "Fixture branch differs from the diagnostic candidate")
+-        section.write_bytes(data)
+-        run([f"{prefix}-objcopy", "--update-section", f".extension={section}", "menu.elf"],
+-            cwd=work, check=True)
++    if bypass or stock_ops:
++        name = "extension"
++        section, data = read_fixture_section(prefix, work, name)
++        base = FACTORY_ENTRY + 4
++        if bypass:
++            at = SPLASH_GATE - base
++            bypass_gate(data, at)
++            require(data[at:at + 3] == candidate[SPLASH_GATE:SPLASH_GATE + 3],
++                    "Fixture branch differs from the diagnostic candidate")
++        else:
++            require(symbols["splash_crops"] - BASE == test_symbols["splash_crops"] - SIM == CROP_TABLE,
++                    "Fixture has a different crop table")
++            use_stock_ops(data, base)
++            fan_section, fan = read_fixture_section(prefix, work, "retired_fan")
++            fan_base = SLOTS["retired_fan"][0]
++            use_stock_ops(fan, fan_base)
++            require(fan[0x14:0x17] == candidate[0x2CA38:0x2CA3B] and
++                    data[0x2AC13-base:0x2AC16-base] == candidate[0x2AC13:0x2AC16],
++                    "Fixture multiply replacements differ from the candidate")
++            write_fixture_section(prefix, work, "retired_fan", fan_section, fan)
++        write_fixture_section(prefix, work, name, section, data)
+     status = run(["qemu-system-xtensa", "-M", "sim", "-cpu", "de212", "-m", "16M", "-display", "none",
+                   "-monitor", "none", "-serial", "none", "-semihosting",
+                   "-device", "loader,file=menu.elf,cpu-num=0"], cwd=work, timeout=10)
+@@ -313,6 +356,8 @@
+         print("Xtensa fixture passed: exact three-byte bypass, zero crop allocations, no splash timer,"
+               " factory/Audio/Fan and shell, stock flush, Activities/TV navigation and packets, and Climate labels")
+     else:
++        if stock_ops:
++            print("Ran the exact stock-operation replacements with the full splash enabled.")
+         print("Xtensa fixture passed: exact indexed frame, splash lifetime and keys, factory/Audio/Fan and shell,"
+               " stock flush, Activities/TV navigation and packets, and Climate labels")
+ 
+@@ -333,8 +378,11 @@
+     parser.add_argument("stock_v48", type=Path)
+     parser.add_argument("approved_png", type=Path)
+     parser.add_argument("--tool-prefix", default="xtensa-esp32-elf")
+-    parser.add_argument("--splash-bypass-control", action="store_true",
+-                        help="skip only the splash gate in the exact combined DSP")
++    controls = parser.add_mutually_exclusive_group()
++    controls.add_argument("--splash-bypass-control", action="store_true",
++                          help="skip only the splash gate in the exact combined DSP")
++    controls.add_argument("--stock-ops-control", action="store_true",
++                          help="replace only the two unverified scalar multiply operations")
+     parser.add_argument("--output", type=Path, help="optional new .OFFLINE.zip after successful QEMU")
+     args = parser.parse_args()
+     if args.output:
+@@ -348,11 +396,16 @@
+         candidate, symbols = build(prefix, work, stock, reference)
+         run([f"{prefix}-size", "-A", "handheld.o"], cwd=work, check=True)
+         print((work / "handheld.su").read_text(), flush=True)
++        if args.splash_bypass_control or args.stock_ops_control:
++            require(sha256(candidate).hexdigest() == COMBINED_DSP_SHA,
++                    "These controls require the exact combined DSP")
+         if args.splash_bypass_control:
+-            require(sha256(candidate).hexdigest() == COMBINED_DSP_SHA,
+-                    "The splash bypass requires the exact combined DSP")
+             bypass_gate(candidate, SPLASH_GATE)
+-        smoke(prefix, work, candidate, symbols, bypass=args.splash_bypass_control)
++        if args.stock_ops_control:
++            require(symbols["splash_crops"] - BASE == CROP_TABLE, "Unexpected crop table location")
++            use_stock_ops(candidate, 0)
++        smoke(prefix, work, candidate, symbols, bypass=args.splash_bypass_control,
++              stock_ops=args.stock_ops_control)
+     print(f"DSP.bin {len(candidate)} bytes, SHA-256 {sha256(candidate).hexdigest()}, "
+           f"FreqChip CRC {crc32(candidate, 0xffffffff):08x}")
+     if args.output:

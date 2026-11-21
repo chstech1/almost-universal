@@ -13,20 +13,32 @@ from custom_components.ununiversal_remote.menu import (
 
 
 class TestMenu(unittest.TestCase):
+    def test_default_soft_keys_open_activities_with_no_device_actions(self):
+        menu = validate_menu(SAMPLE_MENU)
+        home = screen_payload(menu, menu["home"])
+        self.assertEqual(home["title"], "Home")
+        self.assertEqual(home["buttons"], {"soft_1": "TV", "soft_2": "Lights", "soft_3": "Temp"})
+        self.assertEqual(resolve_press(menu, "home", "soft_4"), ("home", None))
+        for key, title in home["buttons"].items():
+            with self.subTest(key=key):
+                activity = title.lower()
+                self.assertEqual(resolve_press(menu, "home", key), (activity, None))
+                self.assertEqual(screen_payload(menu, activity)["title"], title)
+                self.assertEqual(screen_payload(menu, activity)["buttons"], {"soft_4": "Back"})
+                self.assertEqual(resolve_press(menu, activity, "soft_4"), ("home", None))
+
     def test_same_button_depends_on_screen(self):
         draft = deepcopy(SAMPLE_MENU)
         draft["screens"]["tv"]["buttons"]["soft_4"]["effect"] = {
             "kind": "script", "target": "script.tv_shutdown",
         }
         menu = validate_menu(draft)
-        self.assertEqual(resolve_press(menu, "activities", "soft_1"), ("tv", None))
-        self.assertEqual(resolve_press(menu, "tv", "soft_2"), ("ac", None))
-        self.assertEqual(resolve_press(menu, "ac", "soft_4"), ("tv", None))
+        self.assertEqual(resolve_press(menu, "home", "soft_4"), ("home", None))
+        self.assertEqual(resolve_press(menu, "temp", "soft_4"), ("home", None))
         self.assertEqual(
             resolve_press(menu, "tv", "soft_4"),
-            ("activities", {"kind": "script", "target": "script.tv_shutdown"}),
+            ("home", {"kind": "script", "target": "script.tv_shutdown"}),
         )
-        self.assertEqual(screen_payload(menu, "ac")["buttons"], {"soft_4": "Back"})
 
     def test_invalid_shortcut_and_link(self):
         for button, mapping in (

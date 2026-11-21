@@ -1,0 +1,257 @@
+--- a/firmware/dsp-v48-native-menu/build.py
++++ b/firmware/dsp-v48-native-menu/build.py
+@@ -29,6 +29,8 @@
+ COMBINED_DSP_SHA = "3b303cc650d69f0016484c14742c06a7b1b31459ff9e34ca257b09dbe082ae2a"
+ SPLASH_GATE, MENU_FALLBACK = 0x2B0EB, 0x2B14A
+ SPLASH_GATE_BYTES = bytes.fromhex("56b805")
++DECORATION_CALL = 0x2B151
++BYPASS_DSP_SHA = "e421c6f80c40d47bb8b058955405ce639d2e3019e36d3b01b89f930f6f5bb2eb"
+ CROP_TABLE = 0x2BAE0
+ CROP_DIMENSIONS = ((88, 145), (160, 28), (200, 27))
+ STOCK_OPS = {
+@@ -89,12 +91,13 @@
+         raise SystemExit(message)
+ 
+ 
+-def compile_c(prefix, work, name, *, bypass=False):
++def compile_c(prefix, work, name, *, bypass=False, first_activities=False):
+     model = "-mlongcalls" if name == "smoke" else "-mno-longcalls"
+     run([f"{prefix}-gcc", "-c", "-fstack-usage", "-Os", "-std=c11", "-Wall", "-Wextra", "-Werror",
+          "-ffreestanding", "-fno-stack-protector", "-mabi=windowed", "-mtext-section-literals",
+          model, "-DHANDHELD", "-DHANDHELD_LAYOUT", "-DHANDHELD_POLISH", "-DHANDHELD_COLOR",
+-         *(["-DSPLASH_BYPASS"] if bypass else []), "-I", work, "-o", f"{name}.o", HERE / f"{name}.c"], cwd=work, check=True)
++         *(["-DSPLASH_BYPASS"] if bypass else []),
++         *(["-DFIRST_ACTIVITIES"] if first_activities else []), "-I", work, "-o", f"{name}.o", HERE / f"{name}.c"], cwd=work, check=True)
+ 
+ 
+ def link(prefix, work, sections=()):
+@@ -266,7 +269,13 @@
+         cwd=work, check=True)
+ 
+ 
+-def smoke(prefix, work, candidate, symbols, *, bypass=False, stock_ops=False):
++def skip_decorations(payload, base):
++    at = DECORATION_CALL - base
++    require(payload[at:at + 3] == bytes.fromhex("a57cff"), "Unexpected decoration call")
++    payload[at:at + 3] = bytes.fromhex("f02000")
++
++
++def smoke(prefix, work, candidate, symbols, *, bypass=False, stock_ops=False, first_activities=False):
+     def rebase(data):
+         return b"".join(pack("<I", address - BASE + SIM) for (address,) in
+                         ((unpack_from("<I", data, j)[0],) for j in range(0, len(data), 4)))
+@@ -305,7 +314,7 @@
+         (work / f"{name}.bin").write_bytes(data)
+     run([f"{prefix}-as", "--no-transform", "--defsym", "FACTORY_PROOF=1", "--defsym", "REPORT=1",
+          "--defsym", "TILES=1", "--defsym", "COLOR=1", "-o", "start.o", HERE / "smoke.S"], cwd=work, check=True)
+-    compile_c(prefix, work, "smoke", bypass=bypass)
++    compile_c(prefix, work, "smoke", bypass=bypass, first_activities=first_activities)
+     sections = [
+         ("vectors", 0), ("start", 0x400), ("registration_literal", KEY_CALLBACK),
+         ("registration", 0x31581), ("label_call", SET_TEXT_CALL - 7),
+@@ -347,12 +356,20 @@
+                     data[0x2AC13-base:0x2AC16-base] == candidate[0x2AC13:0x2AC16],
+                     "Fixture multiply replacements differ from the candidate")
+             write_fixture_section(prefix, work, "retired_fan", fan_section, fan)
++        if first_activities:
++            skip_decorations(data, base)
++            at = DECORATION_CALL - base
++            require(data[at:at + 3] == candidate[DECORATION_CALL:DECORATION_CALL + 3],
++                    "Fixture decoration site differs from the candidate")
+         write_fixture_section(prefix, work, name, section, data)
+     status = run(["qemu-system-xtensa", "-M", "sim", "-cpu", "de212", "-m", "16M", "-display", "none",
+                   "-monitor", "none", "-serial", "none", "-semihosting",
+                   "-device", "loader,file=menu.elf,cpu-num=0"], cwd=work, timeout=10)
+     require(not status.returncode, f"Xtensa fixture stopped at line modulo 256 = {status.returncode}")
+-    if bypass:
++    if first_activities:
++        print("Xtensa fixture passed: first Activities with all optional artwork allocation paths fail-stop,"
++              " same-boot reentry, power and fresh-key routing, stock colors and TV packets.")
++    elif bypass:
+         print("Xtensa fixture passed: exact three-byte bypass, zero crop allocations, no splash timer,"
+               " factory/Audio/Fan and shell, stock flush, Activities/TV navigation and packets, and Climate labels")
+     else:
+@@ -382,8 +399,13 @@
+                           help="skip only the splash gate in the exact combined DSP")
+     parser.add_argument("--stock-ops-control", action="store_true",
+                           help="replace only the two unverified scalar multiply operations")
++    parser.add_argument("--first-activities-control", action="store_true",
++                        help="show the core menu and skip both splash and decorative object allocation")
+     parser.add_argument("--output", type=Path, help="optional new .OFFLINE.zip after successful QEMU")
+     args = parser.parse_args()
++    if args.first_activities_control:
++        args.splash_bypass_control = True
++        args.stock_ops_control = True
+     if args.output:
+         require(args.output.name.endswith(".OFFLINE.zip"), "Use a new .OFFLINE.zip output path")
+     prefix = str(Path(args.tool_prefix).expanduser().resolve()) if "/" in args.tool_prefix else args.tool_prefix
+@@ -403,8 +425,12 @@
+         if args.stock_ops_control:
+             require(symbols["splash_crops"] - BASE == CROP_TABLE, "Unexpected crop table location")
+             use_stock_ops(candidate, 0)
++        if args.first_activities_control:
++            require(sha256(candidate).hexdigest() == BYPASS_DSP_SHA,
++                    "Expected the exact stock-operations and splash-bypass DSP")
++            skip_decorations(candidate, 0)
+         smoke(prefix, work, candidate, symbols, bypass=args.splash_bypass_control,
+-              stock_ops=args.stock_ops_control)
++              stock_ops=args.stock_ops_control, first_activities=args.first_activities_control)
+     print(f"DSP.bin {len(candidate)} bytes, SHA-256 {sha256(candidate).hexdigest()}, "
+           f"FreqChip CRC {crc32(candidate, 0xffffffff):08x}")
+     if args.output:
+--- a/firmware/dsp-v48-native-menu/smoke.c
++++ b/firmware/dsp-v48-native-menu/smoke.c
+@@ -79,6 +79,14 @@
+ static _Alignas(4) uint8_t crop_heap[3][3220];
+ static unsigned crop_sizes[3], allocated, peak_allocated, alloc_attempts, fail_at;
+ static bool fail_timer;
++#ifdef FIRST_ACTIVITIES
++/* Retail LVGL can spin before an optional allocation call returns to us. */
++static _Noreturn void optional_allocation_must_not_run(void)
++{
++    for (;;)
++        __asm__ volatile ("nop");
++}
++#endif
+ 
+ static struct event_descriptor notice_event;
+ static uint32_t keypad, wheel, notice_group;
+@@ -228,6 +236,9 @@
+ 
+ void *fixture_image_create(void *parent)
+ {
++#ifdef FIRST_ACTIVITIES
++    optional_allocation_must_not_run();
++#endif
+     struct stock_label *image = fixture_label_create(parent);
+     if (image)
+         image->class_pointer = stock_image_class;
+@@ -236,6 +247,9 @@
+ 
+ void *fixture_lv_alloc(size_t size)
+ {
++#ifdef FIRST_ACTIVITIES
++    optional_allocation_must_not_run();
++#endif
+     if (++alloc_attempts == fail_at)
+         return NULL;
+     if (size != 3218 && size != 1148 && size != 1378) {
+@@ -338,6 +352,9 @@
+ 
+ void *fixture_timer_create(void (*callback)(void *), uint32_t period, void *user_data)
+ {
++#ifdef FIRST_ACTIVITIES
++    optional_allocation_must_not_run();
++#endif
+     if (!callback || period != 3000 || user_data)
+         ++errors;
+     if (fail_timer)
+@@ -421,6 +438,9 @@
+         return;
+     }
+     if (code == 0x21 && user_data && callback) {
++#ifdef FIRST_ACTIVITIES
++        optional_allocation_must_not_run();
++#endif
+         struct layout_label *image = layout_child(target, 0);
+         image->on_delete = callback;
+         image->delete_data = user_data;
+@@ -543,7 +563,12 @@
+ #ifdef HANDHELD_POLISH
+ enum {
+     MenuTitle = 0, PanelNote = 7, PanelBody = 8, FirstMark = 9, FirstCrop = 7,
+-    MenuChildCount = 14, SplashChildCount = 12, FirstCropChild = 9,
++    #ifdef FIRST_ACTIVITIES
++    MenuChildCount = 9,
++#else
++    MenuChildCount = 14,
++#endif
++    SplashChildCount = 12, FirstCropChild = 9,
+     TitleY = 45, TitleHeight = 32, ModeY = 79,
+     RowOne = 104, RowTwo = 178, TileHeight = 61, TilePad = 28, TileRadius = 5,
+     IdleFill = 0x1903, FooterX = 1, FooterWidth = 58,
+@@ -774,6 +799,22 @@
+           !timer_runs && !normalized && !sent && changes == 1);
+     stock_first_press(&group, 0x200);
+     CHECK(!alloc_attempts && !proof_timer.callback && !sent && changes == 1);
++#ifdef FIRST_ACTIVITIES
++    /* Recreate the page twice without resetting the DSP's startup state. */
++    for (unsigned i = 0; i < 2; ++i) {
++        spec.count = 2;
++        changes = 0;
++        stock_initial_label(&label, "LCD CHECK.");
++        CHECK(spec.count == MenuChildCount && !alloc_attempts && !proof_timer.callback &&
++              equal(layout_labels[0].text, "Activities") && changes == 1);
++    }
++    press(0x10, 90);
++    press(0x40, 91);
++    press(0x4000, 92);
++    raw_report(10, 0x80, 2, 0, 93);
++    raw_report(10, 0, 0, 0, 94);
++    CHECK(normalized == 3 && !sent && changes == 1);
++#endif
+ #else
+     CHECK(spec.count == SplashChildCount && initial_label_hidden && layout_labels[0].hidden);
+     CHECK(allocated == 5744 && peak_allocated == 5744);
+@@ -867,23 +908,31 @@
+     CHECK(color_matches(slots[0].bg, 0xd772) && color_matches(slots[0].fg, 0x1922) &&
+           color_matches(slots[1].bg, IdleFill) && color_matches(slots[1].fg, 0xf79d) &&
+           slots[1].radius == TileRadius);
++#ifndef FIRST_ACTIVITIES
+     CHECK(layout_labels[FirstMark].image && layout_labels[FirstMark].image->data_size == 80 &&
+           !layout_labels[FirstMark].hidden && layout_labels[FirstMark].x == 23 && layout_labels[FirstMark].y == 112);
+     const struct image_desc *focused_mark = layout_labels[FirstMark].image;
++#endif
+     CHECK(slots[0].align == 1 && slots[0].pad_left == 9 && slots[0].opacity == 255 && slots[0].pad_top == TilePad);
+ 
+     press(0x80, 1);    /* Right focuses Room controls, Down finds an empty cell. */
+     press(0x2000, 2);
+     CHECK(color_matches(slots[1].bg, 0xd772) && color_matches(slots[0].bg, IdleFill) && changes == 2);
++#ifndef FIRST_ACTIVITIES
+     CHECK(layout_labels[FirstMark].image != focused_mark);
+     const struct image_desc *activity_mark = layout_labels[FirstMark].image;
++#endif
+     press(0x200, 3);   /* Open Room controls, focus Climate, then open it. */
++#ifndef FIRST_ACTIVITIES
+     CHECK(!layout_labels[FirstMark].hidden && layout_labels[FirstMark].image != activity_mark &&
+           layout_labels[FirstMark+2].y == 179);
++#endif
+     press(0x80, 4);
+     press(0x200, 5);
+     CHECK(equal(title->text, "Climate") && equal(slots[0].text, "Current temperature"));
++#ifndef FIRST_ACTIVITIES
+     CHECK(layout_labels[FirstMark].hidden && layout_labels[FirstMark+1].hidden);
++#endif
+     CHECK(geometry(&slots[0], 14, 105, 212, 20));
+     CHECK(geometry(&slots[1], 14, 132, 212, 20) && equal(slots[1].text, "--"));
+     CHECK(geometry(feedback, 14, 159, 212, 21) && equal(feedback->text, "No reading yet"));
+@@ -914,6 +963,7 @@
+     CHECK(equal(title->text, "Watch TV") && equal(mode->text, "TV mode") && sent == 0);
+     CHECK(equal(feedback->text, "Hard Back and Home\nstay in TV mode") &&
+           geometry(feedback, 14, 189, 212, 36));
++#ifndef FIRST_ACTIVITIES
+     CHECK(geometry(&layout_labels[PanelNote], 14, 106, 212, 73) &&
+           equal(layout_labels[PanelNote].text, "TV controls"));
+     CHECK(geometry(&layout_labels[PanelBody], 26, 141, 152, 36) &&
+@@ -922,6 +972,7 @@
+     CHECK(layout_labels[FirstMark].image->data_size == 160 && layout_labels[FirstMark].x == 189 &&
+           !layout_labels[FirstMark].hidden && layout_labels[FirstMark+1].hidden &&
+           layout_labels[FirstMark+2].hidden);
++#endif
+     static const char *const captions[] = {"A\nInput", "B\nGuide", "C\nMenu", "D\nBack"};
+     for (unsigned i = 0; i < 4; ++i) {
+         CHECK(geometry(&slots[i], i * 60 + FooterX, 274, FooterWidth, 46) &&
+@@ -943,8 +994,11 @@
+     press(0x2000, 17); /* Move to Scenes and verify both nested mark objects. */
+     press(0x200, 18);
+     CHECK(equal(title->text, "Scenes") && equal(slots[0].text, "Movie night") &&
+-          equal(slots[1].text, "Evening") && !layout_labels[FirstMark].hidden &&
+-          !layout_labels[FirstMark+1].hidden && layout_labels[FirstMark+2].hidden);
++          equal(slots[1].text, "Evening"));
++#ifndef FIRST_ACTIVITIES
++    CHECK(!layout_labels[FirstMark].hidden && !layout_labels[FirstMark+1].hidden &&
++          layout_labels[FirstMark+2].hidden);
++#endif
+     press(0x400, 19);
+     CHECK(equal(title->text, "Activities") && color_matches(slots[2].bg, 0xd772));
+     CHECK(sent == 3 && errors == 0);

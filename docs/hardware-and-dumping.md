@@ -35,6 +35,25 @@ freqchipfreqchipfreqchip
 DSP basic function start running.
 ```
 
+### V06 bench wiring
+
+Use the labeled eight-hole header for these signals. With the **battery side facing you**, USB-C on the left and the IR end on the right, the square `BLE_RX` pad is at the upper right. [Full battery-side photo](../images/component-side.jpg) · [Header close-up from the button side](../images/serial-header.jpg)
+
+```text
+APT_TX   APT_RX   BLE_TX   BLE_RX
+GND      DSP_RX   DSP_TX   3V3
+```
+
+| SwitchBot pad | Connection used |
+| --- | --- |
+| `DSP_TX` | ESP32 `GPIO16` in the original receive-only sketch. For the successful 115200 8N1 captures, move this lead to the old ESP8266 board pin marked `TX`. On that specific board `TX` goes to the onboard CP2102 receiver with ESP8266 `EN` held low. |
+| `BLE_TX` | ESP32 `GPIO32` during the earlier diagnostic. The ESP8266's CP2102 also listened here as a separate trial, before it was moved to `DSP_TX`. |
+| `BLE_RX` | ESP32 `GPIO33`, configured as a high-impedance input for the voltage and receive-only checks. Leave this pad open for DSP logging. |
+| `GND` | Common ground between the remote and whichever receiver is in use. |
+| `DSP_RX`, `APT_RX`, `APT_TX`, `3V3` | Open during receive-only logging. The remote runs on its battery and the ESP board takes power from USB. |
+
+The BLE checks measured approximately 5 mV on `BLE_RX` and 3.36 V on `BLE_TX` with the board powered. With power off, GND had continuity to ESP32 GND and neither BLE signal produced a continuity beep to ground. These checks leave the routes to the tiny U5 package pads unconfirmed. The v4.8 BLE captures on both receivers yielded no repeatable `freqchip` greeting and no completed MCU downloader handshake. For DSP logging, a plain recessed Reset with KATA released, followed by Down to wake the screen, reproduced the startup trace with the battery connected. [Verified DSP receive setup and markers](../firmware/dsp-v48-uart/README.md)
+
 ## Reading U6
 
 The [ESP32 sketch](../tools/u6_esp32/u6_esp32.ino) is the current reader. It expects a classic ESP32 with an Arduino-ESP32 3.x core and uses only the flash identification and read commands. It verifies each SPI burst against an overlapping read, then sends 4 KiB blocks with a CRC and acknowledgment over USB for long captures. The host tracks ordering, saves interrupted reads as `.part` files, and prints the SHA-256 once a range completes. It can log DSP UART and passively count U6 bus activity between reads. The earlier [ESP8266 reader](../tools/u6_reader/u6_reader.ino) and [activity probe](../tools/u6_activity/u6_activity.ino) record the first bench approach.

@@ -1,4 +1,4 @@
-"""Stock Bluetooth firmware recovery for the SwitchBot Universal Remote."""
+"""Local Bluetooth firmware bench tools for the W4600000 REV V06."""
 
 import argparse
 import asyncio
@@ -19,11 +19,21 @@ SWITCHBOT_SERVICE_DATA = ("00000d00-0000-1000-8000-00805f9b34fb",
 SERVICE = "02f00000-0000-0000-0000-00000000fe00"
 SEND = "02f00000-0000-0000-0000-00000000ff01"
 RECEIVE = "02f00000-0000-0000-0000-00000000ff02"
+NORMAL_SERVICES = ("cba20d00-224d-11e6-9fb8-0002a5d5c51b", SWITCHBOT_SERVICE_DATA[1])
+NORMAL_WRITE = "cba20002-224d-11e6-9fb8-0002a5d5c51b"
+NORMAL_NOTIFY = "cba20003-224d-11e6-9fb8-0002a5d5c51b"
+MANUFACTURER = 0x0969
 
-# Populate after bench validation of the v4.8 package and transfer.
-# The value for each SHA-256 is the verified RES start address, or None for
-# a package without RES.bin.
-VERIFIED_V48_RECOVERY_PACKAGES: dict[str, int | None] = {}
+# The SDK uses a resource-relative write address of zero for the full image.
+STOCK_V48_SHA256 = "dac9677e93d4190dccc25498971ad146fee4d8217b6f866138266c088e4ca44e"
+VERIFIED_V48_RECOVERY_PACKAGES = {STOCK_V48_SHA256: 0}
+EXPERIMENTAL_A_DSP_SHA256 = "fae96b9b43e8917b81f0a56ffcc4a2fa305e0b2d07ecdc2c2422990c6e975fff"
+EXPERIMENTAL_LABEL_DSP_SHA256 = "44fad7c5bae85a3370c81794b520246da348d3ce20236c5a3c8b111a977bbca7"
+EXPERIMENTAL_DSP_LABELS = {
+    EXPERIMENTAL_A_DSP_SHA256: "A-button BLE marker",
+    EXPERIMENTAL_LABEL_DSP_SHA256: "Charging → OTA TEST (eight-byte label control)",
+}
+SETUP_BASES = {1: (0x3000, 0x54000), 12: (0,), 22: (0x100000,)}
 COMPONENTS = {
     # Chip query, image setup, erase, data, finalize.
     "RES.bin": (11, 22, 27, 28, 20),
@@ -76,6 +86,22 @@ def recovery_address(digest, images):
     return address
 
 
+def deployment_package(stock_path, dsp_path=None):
+    digest, stock = load_package(stock_path)
+    if digest != STOCK_V48_SHA256 or set(stock) != COMPONENTS.keys():
+        raise OtaError("Expected the original v4.8 ZIP with stock RES, DSP and ARM")
+    res_address = recovery_address(digest, stock)
+    if dsp_path is None:
+        return digest, stock, res_address
+    digest, candidate = load_package(dsp_path)
+    if digest not in EXPERIMENTAL_DSP_LABELS or set(candidate) != {"DSP.bin"}:
+        raise OtaError("Expected a pinned A-button or charging-label archive with only DSP.bin")
+    stock_sectors = (len(stock["DSP.bin"]) + PAGE_SIZE - 1) // PAGE_SIZE
+    if len(candidate["DSP.bin"]) > stock_sectors * PAGE_SIZE:
+        raise OtaError("The candidate exceeds the stock DSP erase range")
+    return digest, candidate, None
+
+
 class OtaLink:
     def __init__(self, client):
         self.client = client
@@ -119,6 +145,36 @@ class OtaLink:
         return reply
 
 
+class CheckedOtaLink(OtaLink):
+    """Validate acknowledgments and the destinations observed on the V06 spare."""
+
+    def __init__(self, client, report):
+        super().__init__(client)
+        self.report = report
+
+    async def exchange(self, packet, operation, **kwargs):
+        reply = await super().exchange(packet, operation, **kwargs)
+        opcode = packet[0]
+        if reply is None:
+            raise OtaError(f"{operation}: disconnected before final acknowledgment")
+        if len(reply) < 4 or reply[1] != opcode:
+            raise OtaError(f"{operation}: unexpected reply ({reply.hex(' ')})")
+        if opcode in SETUP_BASES:
+            check_reply(reply, operation, minimum=8)
+            base = struct.unpack_from("<I", reply, 4)[0]
+            if base not in SETUP_BASES[opcode]:
+                raise OtaError(f"{operation}: unexpected destination 0x{base:08x}")
+            self.report(f"{operation}: destination 0x{base:08x}")
+        if opcode in (3, 5, 14, 16) and reply[0] == 0 and len(reply) >= 8:
+            if struct.unpack_from("<I", packet, 3)[0] != struct.unpack_from("<I", reply, 4)[0]:
+                raise OtaError(f"{operation}: acknowledgment address mismatch")
+        if opcode in (9, 20):
+            if reply != bytes((0, opcode, 4, 0)):
+                raise OtaError(f"{operation}: unexpected final acknowledgment ({reply.hex(' ')})")
+            self.report(f"{operation}: acknowledged ({reply.hex(' ')})")
+        return reply
+
+
 def check_reply(reply, operation, minimum=1):
     if reply and reply[0] != 0:
         raise OtaError(f"{operation}: remote rejected command ({reply.hex()})")
@@ -127,19 +183,21 @@ def check_reply(reply, operation, minimum=1):
     return reply
 
 
+async def setup_component(link, name, size, checksum):
+    query, setup, _, _, _ = COMPONENTS[name]
+    operation = f"{name} chip query"
+    check_reply(await link.exchange(struct.pack("<BHIH", query, 3, 0, 0), operation), operation)
+    return await link.exchange(struct.pack("<BHII", setup, 3, size, checksum), f"{name} setup")
+
+
 async def transfer_component(link, name, data, res_address, report):
-    query, setup, erase, write, finalize = COMPONENTS[name]
+    _, _, erase, write, finalize = COMPONENTS[name]
     size = len(data)
     checksum = firmware_crc(data)
     is_res = name == "RES.bin"
     is_arm = name == "ARM.bin"
-
-    operation = f"{name} chip query"
-    if not await link.exchange(struct.pack("<BHIH", query, 3, 0, 0), operation):
-        raise OtaError(f"{operation}: empty reply")
-
     operation = f"{name} setup"
-    setup_reply = await link.exchange(struct.pack("<BHII", setup, 3, size, checksum), operation)
+    setup_reply = await setup_component(link, name, size, checksum)
     check_reply(setup_reply, operation, minimum=1 if is_res else 8)
     start = res_address if is_res else struct.unpack_from("<I", setup_reply, 4)[0]
     # The ARM and DSP address domains are supplied by the bootloader.
@@ -197,14 +255,19 @@ def is_normal_remote(adv):
     return False
 
 
-async def scan_devices(scan_seconds, normal=False):
+def matches_normal_identity(device, adv, address, manufacturer_id):
+    return (device.address.lower() == address
+            and adv.manufacturer_data.get(MANUFACTURER, b"")[:6] == manufacturer_id)
+
+
+async def scan_devices(scan_seconds, normal=False, *, watch_normal=None):
     from bleak import BleakScanner
 
     found = {}
 
     def detect(device, adv):
         matches = is_normal_remote(adv) if normal else adv.local_name == RECOVERY_NAME
-        if matches:
+        if matches or (watch_normal and matches_normal_identity(device, adv, *watch_normal)):
             found[device.address.lower()] = (device, adv)
 
     try:
@@ -216,53 +279,118 @@ async def scan_devices(scan_seconds, normal=False):
     return found
 
 
-def select_device(candidates, address):
+def select_device(candidates, address, manufacturer_id):
     if address not in candidates:
         raise OtaError(f"{address} did not advertise as {RECOVERY_NAME}")
-    return candidates[address][0]
+    device, adv = candidates[address]
+    if adv.local_name != RECOVERY_NAME:
+        raise OtaError("The selected device is not in recovery mode")
+    observed = adv.manufacturer_data.get(MANUFACTURER, b"")[:6]
+    update_mac = manufacturer_id[:5] + bytes(((manufacturer_id[5] + 1) % 256,))
+    if observed and observed not in (manufacturer_id, update_mac):
+        raise OtaError("Recovery advertisement conflicts with the selected spare")
+    return device
 
 
-async def flash(address, images, res_address, scan_seconds, report):
+async def recovery_session(address, normal_address, manufacturer_id, images, res_address, report):
+    if tuple(images) != tuple(COMPONENTS) or res_address != 0:
+        raise OtaError("Recovery requires the complete stock RES, DSP and ARM restore")
+
     from bleak import BleakClient
 
-    device = select_device(await scan_devices(scan_seconds), address)
+    candidates = await scan_devices(8, watch_normal=(normal_address, manufacturer_id))
+    if normal_address in candidates:
+        raise OtaError("The selected spare is still advertising in normal mode")
+    device = select_device(candidates, address, manufacturer_id)
 
     def disconnected(_client):
         if link is not None:
             link.on_disconnect()
 
     link = None
-    async with BleakClient(device, disconnected_callback=disconnected) as client:
-        link = OtaLink(client)
+    async with BleakClient(device, timeout=10, disconnected_callback=disconnected) as client:
+        link = CheckedOtaLink(client, report)
         try:
             await asyncio.wait_for(client.start_notify(link.receive, link.on_notify), COMMAND_TIMEOUT)
         except TimeoutError as error:
             raise OtaError("Timed out subscribing to FreqChip recovery replies") from error
+        await asyncio.sleep(1)
+        # Recovery firmware may erase on the first OTA command. These checks
+        # precede the explicit erase packets and are part of the stock restore.
+        for name in reversed(images):
+            data = images[name]
+            await setup_component(link, name, len(data), firmware_crc(data))
         for name, data in images.items():
             await transfer_component(link, name, data, res_address, report)
 
 
-def run_bluetooth(operation, *args):
+async def verify_v48(address, manufacturer_id, report):
+    from bleak import BleakClient, BleakScanner
+
+    device = await BleakScanner.find_device_by_filter(
+        lambda dev, adv: matches_normal_identity(dev, adv, address, manufacturer_id), timeout=25,
+    )
+    if device is None:
+        raise OtaError("The spare's normal-mode UUID and manufacturer ID did not both match")
+    async with BleakClient(device, timeout=10) as client:
+        service = next((s for uuid in NORMAL_SERVICES if (s := client.services.get_service(uuid))), None)
+        writer = service.get_characteristic(NORMAL_WRITE) if service else None
+        notifier = service.get_characteristic(NORMAL_NOTIFY) if service else None
+        if (writer is None or notifier is None or "notify" not in notifier.properties
+                or not {"write", "write-without-response"}.intersection(writer.properties)):
+            raise OtaError("Normal-mode command service missing or incompatible")
+        replies = asyncio.Queue()
+        try:
+            await asyncio.wait_for(
+                client.start_notify(notifier, lambda _, data: replies.put_nowait(bytes(data))),
+                COMMAND_TIMEOUT,
+            )
+            async with asyncio.timeout(COMMAND_TIMEOUT):
+                await client.write_gatt_char(writer, bytes.fromhex("57 00 00 00 02"),
+                                             response="write" in writer.properties)
+                while True:
+                    reply = await replies.get()
+                    if len(reply) == 20 and reply[:4] == b"\x01\x00\x00\x00":
+                        break
+        except TimeoutError as error:
+            raise OtaError("Timed out waiting for normal-mode firmware readback") from error
+    version = reply[5]
+    report(f"Normal-mode ARM reports v{version // 10}.{version % 10} with {reply[4]}% battery")
+    if version != 48:
+        raise OtaError("Expected normal-mode ARM firmware v4.8")
+    return reply
+
+
+def run_bluetooth(operation, *args, **kwargs):
     try:
         from bleak.exc import BleakError
     except ImportError as error:
         raise OtaError("Install the Bluetooth dependency with python -m pip install -r requirements.txt") from error
     try:
-        return asyncio.run(operation(*args))
+        return asyncio.run(operation(*args, **kwargs))
     except BleakError as error:
         raise OtaError(f"Bluetooth failed: {error}") from error
 
 
-def confirm_version():
-    print("Transfer ended and the remote disconnected for reboot.")
-    if not sys.stdin.isatty():
-        print("Version verification pending. Confirm v4.8 using a local firmware readback.")
-        return 2
-    version = input("After the remote boots, enter the version from local firmware readback: ")
-    if version.strip().lower().removeprefix("v") != "4.8":
-        raise OtaError("Firmware v4.8 was not confirmed after transfer")
-    print("Stock firmware v4.8 confirmed by the operator.")
-    return 0
+def manufacturer_id(value):
+    try:
+        address = bytes.fromhex(value.replace(":", ""))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("Expected a six-byte manufacturer identifier") from error
+    if len(address) != 6:
+        raise argparse.ArgumentTypeError("Expected a six-byte manufacturer identifier")
+    return address
+
+
+def report(message):
+    print(message, flush=True)
+
+
+def report_images(digest, images):
+    report(f"Archive SHA-256 {digest}")
+    for name, data in images.items():
+        report(f"{name:<7} {len(data):>10,} bytes  FreqChip CRC {firmware_crc(data):08x}  "
+               f"SHA-256 {hashlib.sha256(data).hexdigest()}")
 
 
 def main(argv=None):
@@ -270,15 +398,34 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     inspect = commands.add_parser("inspect", help="validate an OTA ZIP offline")
     inspect.add_argument("package", type=Path)
+    preflight = commands.add_parser("preflight", help="check pinned deployment images offline")
+    preflight.add_argument("package", type=Path, help="original stock v4.8 ZIP")
+    preflight.add_argument("--dsp-package", type=Path, help="pinned A-button or charging-label DSP ZIP")
     scan = commands.add_parser("scan", help="list Universal Remote BLE advertisements")
     scan.add_argument("--seconds", type=float, default=8)
     scan.add_argument("--normal", action="store_true", help="list remotes in normal mode")
-    upload = commands.add_parser("flash", help="send a verified v4.8 recovery ZIP")
-    upload.add_argument("package", type=Path)
-    upload.add_argument("--device", required=True, type=UUID, help="UUID printed by scan")
+    status = commands.add_parser("status", help="verify normal-mode identity and read v4.8")
+    probe = commands.add_parser("probe-recovery", help="disabled until non-erasing recovery entry is verified")
+    stock = commands.add_parser("flash", help="restore all three stock v4.8 images")
+    dsp = commands.add_parser("flash-dsp", help="disabled until non-erasing recovery entry is verified")
+    for command in (status, probe, stock, dsp):
+        command.add_argument("--normal-device", required=True, type=UUID, help="spare's normal-mode UUID")
+        command.add_argument("--manufacturer-id", required=True, type=manufacturer_id,
+                             help="spare's six-byte manufacturer identifier")
+    for command in (probe, stock, dsp):
+        command.add_argument("package", type=Path, help="original stock v4.8 ZIP")
+        command.add_argument("--device", required=True, type=UUID, help="spare's recovery-mode UUID")
+    probe.add_argument("--dsp-package", type=Path, help="pinned A-button or charging-label DSP ZIP")
+    dsp.add_argument("--dsp-package", required=True, type=Path, help="pinned A-button or charging-label DSP ZIP")
     args = parser.parse_args(argv)
 
     try:
+        if args.command in ("probe-recovery", "flash-dsp"):
+            raise OtaError(
+                f"{args.command} is disabled until a non-erasing recovery entry is verified. "
+                "Stock recovery can erase external flash on the first OTA command. "
+                "Use preflight for offline package checks."
+            )
         if args.command == "scan":
             if not math.isfinite(args.seconds) or args.seconds <= 0:
                 raise OtaError("Scan duration must be a positive number of seconds")
@@ -289,18 +436,38 @@ def main(argv=None):
             if not found:
                 print(f"No devices found for {name}.")
             return 0
-        digest, images = load_package(args.package)
         if args.command == "inspect":
-            print(f"SHA-256 {digest}")
-            for name, data in images.items():
-                print(f"{name:<7} {len(data):>10,} bytes  FreqChip CRC {firmware_crc(data):08x}")
+            digest, images = load_package(args.package)
+            report_images(digest, images)
             status = "verified" if digest in VERIFIED_V48_RECOVERY_PACKAGES else "unverified"
-            print(f"SwitchBot v4.8 recovery package: {status}")
+            report(f"SwitchBot v4.8 recovery package: {status}")
             return 0
-        res_address = recovery_address(digest, images)
-        run_bluetooth(flash, str(args.device), images, res_address, 8,
-                      lambda line: print(line, flush=True))
-        return confirm_version()
+        if args.command == "status":
+            reply = run_bluetooth(verify_v48, str(args.normal_device), args.manufacturer_id, report)
+            lift = {0: "off", 1: "on"}.get(reply[8], "unknown")
+            report(f"Raise to Wake {lift} (raw byte 8 = 0x{reply[8]:02x})")
+            report(f"Base info {reply.hex(' ')}")
+            return 0
+        dsp_path = getattr(args, "dsp_package", None)
+        digest, images, res_address = deployment_package(args.package, dsp_path)
+        if dsp_path is not None:
+            report(f"Verified local stock rollback ZIP SHA-256 {STOCK_V48_SHA256}")
+            report(f"DSP candidate: {EXPERIMENTAL_DSP_LABELS[digest]}")
+            report("Offline validation only. Live DSP-only transfer is disabled.")
+        report_images(digest, images)
+        if dsp_path is None:
+            report("Transfer order: " + ", ".join(images))
+        if args.command == "preflight":
+            return 0
+        if args.device == args.normal_device:
+            raise OtaError("The normal and recovery UUIDs must identify distinct advertisements")
+        report("Stock restore may erase external flash during recovery setup.")
+        run_bluetooth(recovery_session, str(args.device), str(args.normal_device), args.manufacturer_id,
+                      images, res_address, report)
+        report("Stock transfers acknowledged. Verifying normal-mode reboot.")
+        run_bluetooth(verify_v48, str(args.normal_device), args.manufacturer_id, report)
+        report("Stock v4.8 Bluetooth reboot verified. Check the display to complete the rehearsal.")
+        return 0
     except (OtaError, OSError, EOFError, RuntimeError, zipfile.BadZipFile) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1

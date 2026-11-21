@@ -60,6 +60,9 @@ class UnuniversalRemotePanel extends HTMLElement {
         }
         * { box-sizing: border-box; }
         [hidden] { display: none !important; }
+        #handheld-modes { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 12px auto 0;
+          max-width: 930px; padding-inline: 16px; }
+        #handheld-modes [aria-pressed="true"] { border-color: var(--primary-color, #526e35); font-weight: 650; }
         header {
           display: flex; align-items: center; gap: 10px; min-height: 64px; padding: 10px 24px;
           background: var(--paper); border-bottom: 1px solid var(--line);
@@ -150,6 +153,7 @@ class UnuniversalRemotePanel extends HTMLElement {
         <ha-menu-button></ha-menu-button>
         <h1>Remote Menus</h1>
         <div class="spacer"></div>
+        <button id="handheld-draft" hidden>Handheld draft</button>
         <button id="reload" hidden>Reload</button>
         <button id="save" class="save" disabled>Save</button>
       </header>
@@ -184,7 +188,14 @@ class UnuniversalRemotePanel extends HTMLElement {
             <p id="connection" class="muted"></p>
           </section>
         </div>
-      </main>`;
+      </main>
+      <nav id="handheld-modes" aria-label="Remote menu workspace" hidden>
+        <button type="button" id="fixed-workspace-button" aria-pressed="true">Fixed bindings</button>
+        <button type="button" id="builder-workspace-button" aria-pressed="false">Menu builder</button>
+        <span id="workspace-status" class="muted" role="status"></span>
+      </nav>
+      <div id="handheld-workspace" hidden></div>
+      <div id="builder-workspace" hidden></div>`;
     this.button = SHORTCUTS[0];
     this.previewRequest = 0;
     this.$("#add").onclick = () => this.addScreen();
@@ -192,6 +203,9 @@ class UnuniversalRemotePanel extends HTMLElement {
     this.$("#save").onclick = () => this.save();
     this.$("#reload").onclick = () => this.load();
     this.$("#preview-home").onclick = () => this.showPreview(this.menu.home);
+    this.$("#handheld-draft").onclick = () => this.toggleHandheldDraft();
+    this.$("#fixed-workspace-button").onclick = () => this.showBuilder(false);
+    this.$("#builder-workspace-button").onclick = () => this.openBuilder();
   }
 
   $(selector) {
@@ -209,6 +223,9 @@ class UnuniversalRemotePanel extends HTMLElement {
     if (this.menu && previous) {
       const climate = this.menu.screens[this.previewId]?.climate;
       if (climate && previous.states[climate] !== hass.states[climate]) this.refreshPreview();
+    }
+    if (previous && !this.$("#builder-workspace").hidden) {
+      this.$("#builder-workspace").firstChild?.portable.refresh(previous.states, hass.states);
     }
   }
 
@@ -235,6 +252,13 @@ class UnuniversalRemotePanel extends HTMLElement {
       this.notice("Loading menus…");
       const configuration = await this.call("get");
       this.useConfiguration(configuration);
+      if (configuration.ble_mode === "stock_v48_handheld") {
+        await this.mountHandheldDraft(configuration);
+        this.$("main").hidden = this.$("#save").hidden = true;
+        this.$("#handheld-workspace").hidden = false;
+        this.$("#handheld-modes").hidden = false;
+        return;
+      }
       this.selected = this.menu.home;
       this.button = SHORTCUTS[0];
       this.$(".layout").hidden = false;
@@ -250,13 +274,87 @@ class UnuniversalRemotePanel extends HTMLElement {
   useConfiguration(configuration) {
     this.menu = configuration.menu;
     this.revision = configuration.revision;
+    this.stockKeys = configuration.stock_keys;
+    this.stockMarker = configuration.ble_mode === "stock_v48";
+    this.$("#add").hidden = this.$("#export").hidden = Boolean(this.stockKeys);
+    this.$("#handheld-draft").hidden = Boolean(this.stockKeys);
     this.$("#save").disabled = true;
     this.$("#export").disabled = false;
     this.$("#reload").hidden = true;
-    this.$("#connection").textContent = [
+    this.$("#connection").textContent = this.stockMarker
+      ? "Stock ARM v4.8 · Only soft key A sends an action. Screen navigation is preview only."
+      : this.stockKeys ? "Stock ARM v4.8 · The handheld supplies the Home and Controls layout." : [
       `MQTT remote ID · ${configuration.remote_id}`,
       configuration.ble_address && `Bluetooth · ${configuration.ble_address}`,
     ].filter(Boolean).join(" · ");
+  }
+
+  async toggleHandheldDraft() {
+    const workspace = this.$("#handheld-workspace");
+    const button = this.$("#handheld-draft");
+    const opening = workspace.hidden;
+    if (opening && !workspace.firstChild) {
+      button.disabled = true;
+      try {
+        await this.mountHandheldDraft();
+      } catch {
+        this.notice("Could not load the handheld draft.", true);
+        return;
+      } finally {
+        button.disabled = false;
+      }
+    }
+    workspace.hidden = !opening;
+    this.$("main").hidden = this.$("#save").hidden = opening;
+    button.textContent = opening ? "Saved menus" : "Handheld draft";
+  }
+
+  async mountHandheldDraft(configuration) {
+    await import("/ununiversal_remote/handheld-draft.js?v=0.1.6");
+    const draft = element("ununiversal-handheld-draft");
+    if (configuration) {
+      draft.configureMatched(
+        configuration,
+        () => this.ha.states,
+        (menu, revision, tv_entry_action) => this.call("save", {
+          menu, revision, ...(tv_entry_action === undefined ? {} : { tv_entry_action }),
+        }),
+      );
+    }
+    this.$("#handheld-workspace").replaceChildren(draft);
+  }
+
+  showBuilder(open) {
+    this.wantBuilder = open;
+    this.$("#builder-workspace-button").setAttribute("aria-pressed", String(open));
+    this.$("#fixed-workspace-button").setAttribute("aria-pressed", String(!open));
+    this.$("#handheld-workspace").hidden = open;
+    this.$("#builder-workspace").hidden = !open;
+    if (open) this.$("#builder-workspace").firstChild?.portable.refresh();
+  }
+
+  async openBuilder() {
+    const workspace = this.$("#builder-workspace");
+    if (workspace.firstChild) return this.showBuilder(true);
+    const button = this.$("#builder-workspace-button");
+    const status = this.$("#workspace-status");
+    this.wantBuilder = true;
+    button.disabled = true;
+    status.textContent = "Loading draft…";
+    try {
+      const [{ MenuBuilder }, saved] = await Promise.all([
+        import("/ununiversal_remote/menu-builder.js?v=0.1.6"), this.call("draft_get"),
+      ]);
+      const element_ = element("ununiversal-handheld-draft");
+      element_.portable = new MenuBuilder(element_, (action, data) => this.call(action, data), () => this.ha.states, saved);
+      workspace.replaceChildren(element_);
+      status.textContent = "";
+      if (this.wantBuilder) this.showBuilder(true);
+    } catch (error) {
+      status.textContent = error.message || "Could not load the menu builder.";
+    } finally {
+      button.disabled = false;
+    }
   }
 
   async exportMenu() {
@@ -346,6 +444,20 @@ class UnuniversalRemotePanel extends HTMLElement {
   renderEditor() {
     this.renderScreens();
     const screen = this.menu.screens[this.selected];
+    const supported = this.stockKeys?.[this.selected];
+    this.$(".bindings").hidden = supported?.length === 0;
+    if (supported) {
+      const help = this.stockMarker
+        ? supported.length ? "Choose the switch that soft key A toggles." : "Controls is available in the preview."
+        : "Choose a physical key and assign its switch action.";
+      this.$("#screen-fields").replaceChildren(element("p", help));
+      if (supported.length) {
+        if (!supported.includes(this.button)) this.button = supported[0];
+        this.renderButtons();
+        this.renderBinding();
+      }
+      return;
+    }
     const title = element("input", undefined, { id: "title", maxlength: "64", required: "" });
     title.value = screen.title;
     title.oninput = () => {
@@ -397,9 +509,11 @@ class UnuniversalRemotePanel extends HTMLElement {
   }
 
   renderButtons() {
+    if (this.stockMarker) return;
     const screen = this.menu.screens[this.selected];
     const expanded = this.$("#buttons details")?.open || MORE_KEYS.includes(this.button);
-    const groups = [SHORTCUTS, HARD_KEYS, MORE_KEYS].map(keys => {
+    const keyGroups = this.stockKeys ? [this.stockKeys[this.selected]] : [SHORTCUTS, HARD_KEYS, MORE_KEYS];
+    const groups = keyGroups.map(keys => {
       const group = element("div", undefined, { class: "key-group" });
       for (const key of keys) {
         const button = element("button", NAMES[key], {
@@ -418,6 +532,10 @@ class UnuniversalRemotePanel extends HTMLElement {
       }
       return group;
     });
+    if (this.stockKeys) {
+      this.$("#buttons").replaceChildren(...groups);
+      return;
+    }
     const more = element("details");
     more.open = expanded;
     more.append(element("summary", "More physical keys"), groups.pop());
@@ -433,7 +551,7 @@ class UnuniversalRemotePanel extends HTMLElement {
       this.change();
     };
     const fields = [];
-    if (SHORTCUTS.includes(this.button)) {
+    if (!this.stockKeys && SHORTCUTS.includes(this.button)) {
       const label = element("input", undefined, { maxlength: "32" });
       label.value = binding.label || "";
       label.oninput = () => { binding.label = label.value; update(); };
@@ -443,7 +561,8 @@ class UnuniversalRemotePanel extends HTMLElement {
     const destination = select([["", "Stay on screen"], ...screens], binding.next || "");
     destination.onchange = () => { binding.next = destination.value; update(); };
     const kind = binding.effect?.kind || "";
-    const action = select(Object.entries(ACTIONS), kind);
+    const action = select(Object.entries(ACTIONS).filter(([id]) =>
+      !this.stockKeys || id === "" || id === "switch"), kind);
     action.id = "action";
     action.onchange = () => {
       binding.effect = action.value ? { kind: action.value } : null;
@@ -452,9 +571,9 @@ class UnuniversalRemotePanel extends HTMLElement {
       this.renderBinding();
       this.$("#action").focus();
     };
-    if (this.button !== "wheel") fields.push(field("Open screen", destination));
+    if (!this.stockKeys && this.button !== "wheel") fields.push(field("Open screen", destination));
     fields.push(field("Action", action));
-    if (kind) {
+    if (kind && !this.stockKeys) {
       const trigger = select(Object.entries(TRIGGERS), binding.effect_on || "");
       trigger.onchange = () => {
         if (trigger.value) binding.effect_on = trigger.value;
@@ -540,18 +659,23 @@ class UnuniversalRemotePanel extends HTMLElement {
     );
     handset.append(display);
     const bindings = this.menu.screens[this.previewId]?.buttons || {};
-    const extraKeys = MORE_KEYS.filter(key => bindings[key]?.next || bindings[key]?.effect);
+    const hardKeys = this.stockKeys
+      ? [...HARD_KEYS, ...MORE_KEYS].filter(key => bindings[key]?.effect)
+      : [...HARD_KEYS, ...MORE_KEYS.filter(key => bindings[key]?.next || bindings[key]?.effect)];
     for (const [keys, layout] of [
-      [SHORTCUTS, "soft-keys"], [[...HARD_KEYS, ...extraKeys], "key-group hard"],
+      [SHORTCUTS, "soft-keys"], [hardKeys, "key-group hard"],
     ]) {
+      if (!keys.length) continue;
       const group = element("div", undefined, { class: layout });
       const soft = keys === SHORTCUTS;
       for (const key of keys) {
         const label = soft ? labels[key] : NAMES[key];
+        const inactive = soft && this.stockKeys && !bindings[key]?.next
+          && !this.stockKeys[this.previewId]?.includes(key);
         const button = element("button", soft ? "" : label, {
-          "data-press": key, "aria-label": label || `${NAMES[key]} (empty)`,
+          "data-press": key, "aria-label": inactive || !label ? `${NAMES[key]} (empty)` : label,
         });
-        button.disabled = !label;
+        button.disabled = inactive || !label;
         button.onclick = () => this.runPreview(key);
         group.append(button);
       }

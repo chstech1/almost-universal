@@ -1,0 +1,24 @@
+--- a/firmware/dsp-v48-native-menu/build.py
++++ b/firmware/dsp-v48-native-menu/build.py
+@@ -336,7 +336,7 @@
+             bypass_gate(data, at)
+             require(data[at:at + 3] == candidate[SPLASH_GATE:SPLASH_GATE + 3],
+                     "Fixture branch differs from the diagnostic candidate")
+-        else:
++        if stock_ops:
+             require(symbols["splash_crops"] - BASE == test_symbols["splash_crops"] - SIM == CROP_TABLE,
+                     "Fixture has a different crop table")
+             use_stock_ops(data, base)
+@@ -378,10 +378,9 @@
+     parser.add_argument("stock_v48", type=Path)
+     parser.add_argument("approved_png", type=Path)
+     parser.add_argument("--tool-prefix", default="xtensa-esp32-elf")
+-    controls = parser.add_mutually_exclusive_group()
+-    controls.add_argument("--splash-bypass-control", action="store_true",
++    parser.add_argument("--splash-bypass-control", action="store_true",
+                           help="skip only the splash gate in the exact combined DSP")
+-    controls.add_argument("--stock-ops-control", action="store_true",
++    parser.add_argument("--stock-ops-control", action="store_true",
+                           help="replace only the two unverified scalar multiply operations")
+     parser.add_argument("--output", type=Path, help="optional new .OFFLINE.zip after successful QEMU")
+     args = parser.parse_args()

@@ -1,0 +1,210 @@
+--- a/firmware/dsp-v48-native-menu/build.py
++++ b/firmware/dsp-v48-native-menu/build.py
+@@ -1,4 +1,4 @@
+-"""Build the offline Activities header against the exact Office-controls DSP."""
++"""Build the offline Watch TV entry event against the deployed compact Activities DSP."""
+ 
+ import argparse
+ import re
+@@ -33,6 +33,9 @@
+ 
+ OFFICE_ZIP_SHA = "b887ffddbef82a7ff78b23ee867b2424d2ce530754de32ffa82d76d3d9d3263c"
+ OFFICE_DSP_SHA = "a114b96b245cd891562b7a6fb0956d62cedeb2231722ad3a7bfc270636517293"
++
++HEADER_ZIP_SHA = "0ab181911b1982c0b8791ef1518977f652a67fade37f2f41bbd2923d38a4fbe2"
++HEADER_DSP_SHA = "8844d43533a77ed06f219ce1c927d9492fda9b3181917300197e248e6e99fcd6"
+ 
+ SLOTS = {
+     "retired_audio": (0x271A4, 0x27405),
+@@ -184,7 +187,7 @@
+     candidate[offset:offset + 3] = instruction.to_bytes(3, "little")
+ 
+ 
+-def build(prefix, work, stock, reference, working, office):
++def build(prefix, work, stock, reference, working, office, header):
+     verify_retirements(stock, reference)
+     compile_c(prefix, work, "handheld")
+     symbols = link(prefix, work)
+@@ -237,12 +240,12 @@
+     office_changes = [range(start, end) for start, end in regions.values()]
+     office_changes.extend(range(offset, offset + 3) for offset in (SET_TEXT_CALL, REPORT_CALL, FRESH_CALL, BATTERY_CALL))
+     office_changes.extend(range(slot, slot + 4) for slot, _, _, _, _ in RETIRED_PAGES.values())
+-    for name, baseline in (("Working stock operations", working), ("Office", office)):
++    for name, baseline in (("Working stock operations", working), ("Office", office), ("Activities header", header)):
+         require(len(baseline) == len(candidate) and
+                 all(old == new or any(i in region for region in office_changes)
+                     for i, (old, new) in enumerate(zip(baseline, candidate))),
+                 f"Unexpected difference outside the approved {name} diff")
+-    print("Office-image diff verified. No widened flash span or newly retired stock region.")
++    print("Deployed-header diff verified. No widened flash span or newly retired stock region.")
+     return candidate, symbols
+ 
+ 
+@@ -314,7 +317,7 @@
+                   "-monitor", "none", "-serial", "none", "-semihosting",
+                   "-device", "loader,file=menu.elf,cpu-num=0"], cwd=work, timeout=10)
+     require(not status.returncode, f"Xtensa fixture stopped with assertion code {status.returncode}")
+-    print("Xtensa fixture passed: compact Activities layout and stock battery call-through,"
++    print("Xtensa fixture passed: deliberate Watch TV entry packet, compact Activities and battery,"
+           " exact indexed splash, stock flush, Office and TV action packets, and Climate readout")
+ 
+ 
+@@ -334,6 +337,7 @@
+     parser.add_argument("stock_v48", type=Path)
+     parser.add_argument("working_stock_ops", type=Path)
+     parser.add_argument("office_baseline", type=Path)
++    parser.add_argument("header_baseline", type=Path)
+     parser.add_argument("approved_png", type=Path)
+     parser.add_argument("--tool-prefix", default="xtensa-esp32-elf")
+     parser.add_argument("--output", type=Path, help="optional new .OFFLINE.zip after successful QEMU")
+@@ -345,10 +349,11 @@
+     reference = load(args.color_baseline, COLOR_ZIP_SHA, COLOR_DSP_SHA, only_dsp=True)
+     working = load(args.working_stock_ops, WORKING_ZIP_SHA, WORKING_DSP_SHA, only_dsp=True)
+     office = load(args.office_baseline, OFFICE_ZIP_SHA, OFFICE_DSP_SHA, only_dsp=True)
+-    with TemporaryDirectory(prefix="full-splash-proof-") as directory:
++    header = load(args.header_baseline, HEADER_ZIP_SHA, HEADER_DSP_SHA, only_dsp=True)
++    with TemporaryDirectory(prefix="tv-entry-proof-") as directory:
+         work = Path(directory)
+         prepare(args.approved_png, work)
+-        candidate, symbols = build(prefix, work, stock, reference, working, office)
++        candidate, symbols = build(prefix, work, stock, reference, working, office, header)
+         run([f"{prefix}-size", "-A", "handheld.o"], cwd=work, check=True)
+         print((work / "handheld.su").read_text(), flush=True)
+         smoke(prefix, work, candidate, symbols)
+--- a/firmware/dsp-v48-native-menu/handheld.c
++++ b/firmware/dsp-v48-native-menu/handheld.c
+@@ -8,7 +8,7 @@
+     ACTIVITIES, ROOM, SCENES, LIGHTS, CLIMATE, BLINDS, TV, COVERS, CURTAINS, FAN,
+ };
+ 
+-enum { STOCK_POWER_KEYS = 0x4050 };
++enum { STOCK_POWER_KEYS = 0x4050, PRESS_EVENT = 1, ENTER_EVENT = 2 };
+ static const uint8_t wire_screen[] = {
+     [TV] = 3, [LIGHTS] = 5, [BLINDS] = 6, [CURTAINS] = 7, [FAN] = 8,
+ };
+@@ -696,11 +696,11 @@
+     }
+ }
+ 
+-static __attribute__((noinline)) void send_press(unsigned screen, unsigned control,
+-                                               const uint8_t timestamp[4])
++static __attribute__((noinline)) void send_event(unsigned kind, unsigned screen, unsigned control,
++                                                const uint8_t timestamp[4])
+ {
+     uint8_t payload[0x302] __attribute__((aligned(4))) = {
+-        11, 0, 0x7e, 'U', 'R', 1, 1, screen, control,
++        11, 0, 0x7e, 'U', 'R', 1, kind, screen, control,
+         timestamp[0], timestamp[1], timestamp[2], timestamp[3]
+     };
+     stock_ipc_send(19, payload, sizeof payload);
+@@ -732,14 +732,18 @@
+         if (key == D || (view != TV && key == BACK))
+             open_view(label, screen->parent, screen->parent_focus);
+         else if (view == TV || key <= (view == LIGHTS || view == FAN ? A : C))
+-            send_press(source, key, report->timestamp);
++            send_event(PRESS_EVENT, source, key, report->timestamp);
+     } else if (key == BACK && view != ACTIVITIES) {
+         open_view(label, screen->parent, screen->parent_focus);
+     } else if (key == OK) {
+         static const uint8_t destinations[] = {TV, ROOM, SCENES, LIGHTS, CLIMATE, COVERS, FAN,
+                                                 0, 0, BLINDS, CURTAINS};
+-        if (view == ACTIVITIES || view == ROOM || view == COVERS)
+-            open_view(label, destinations[screen->first_tile + handheld_state.focus], 0);
++        if (view == ACTIVITIES || view == ROOM || view == COVERS) {
++            unsigned destination = destinations[screen->first_tile + handheld_state.focus];
++            open_view(label, destination, 0);
++            if (view == ACTIVITIES && destination == TV && handheld_state.startup == SPLASH_SHOWN)
++                send_event(ENTER_EVENT, wire_screen[TV], 0, report->timestamp);
++        }
+     } else {
+         move_focus(label, key, screen->count);
+     }
+--- a/firmware/dsp-v48-native-menu/smoke.c
++++ b/firmware/dsp-v48-native-menu/smoke.c
+@@ -533,15 +533,21 @@
+     stock_dispatch_report(&report);
+ }
+ 
+-static int match_frame(uint8_t screen, uint8_t control, uint32_t ticks)
+-{
+-    static const uint8_t prefix[] = {11, 0, 0x7e, 'U', 'R', 1, 1};
++static int match_event(uint8_t kind, uint8_t screen, uint8_t control, uint32_t ticks)
++{
++    static const uint8_t prefix[] = {11, 0, 0x7e, 'U', 'R', 1};
+     for (unsigned i = 0; i < sizeof prefix; ++i)
+         if (last_frame[i] != prefix[i])
+             return 0;
+     uint32_t timestamp = (uint32_t)last_frame[9] | (uint32_t)last_frame[10] << 8 |
+                          (uint32_t)last_frame[11] << 16 | (uint32_t)last_frame[12] << 24;
+-    return last_frame[7] == screen && last_frame[8] == control && timestamp == ticks;
++    return last_frame[6] == kind && last_frame[7] == screen &&
++           last_frame[8] == control && timestamp == ticks;
++}
++
++static int match_frame(uint8_t screen, uint8_t control, uint32_t ticks)
++{
++    return match_event(1, screen, control, ticks);
+ }
+ #endif
+ 
+@@ -1048,11 +1054,18 @@
+           geometry(feedback, 198, 22, 28, 18));
+ 
+     press(0x100, 8);
+-    press(0x200, 9);   /* Open TV mode. */
++    raw_report(10, 0x200, 1, 1, 0x87); /* An OK with wheel data is ineligible. */
++    raw_report(10, 0x201, 1, 0, 0x88); /* An OK chord is ineligible. */
++    CHECK(sent == 0 && equal(title->text, "Activities"));
++    press(0x200, 0x12345678); /* One deliberate Watch TV entry packet. */
++    CHECK(sent == 1 && match_event(2, 3, 0, 0x12345678));
+     raw_report(10, 0x200, 1, 0, 10);
+     raw_report(10, 0x200, 2, 0, 11);
+     raw_report(10, 0, 0, 0, 12);
+-    CHECK(equal(title->text, "Watch TV") && equal(mode->text, "TV mode") && sent == 0);
++    CHECK(equal(title->text, "Watch TV") && equal(mode->text, "TV mode") && sent == 1);
++    spec.count = 2;
++    stock_initial_label(&label, "LCD CHECK.");
++    CHECK(equal(title->text, "Watch TV") && sent == 1); /* Page recreation. */
+     CHECK(equal(feedback->text, "Hard Back and Home\nstay in TV mode") &&
+           geometry(feedback, 14, 189, 212, 36));
+     CHECK(feedback->align == 1 && color_matches(feedback->fg, 0xadb5));
+@@ -1075,18 +1088,23 @@
+     }
+ 
+     press(1, 13);      /* A Input sends a single Home Assistant report. */
+-    CHECK(sent == 1 && match_frame(3, 1, 13));
++    CHECK(sent == 2 && match_frame(3, 1, 13));
+     press(0x400, 14);  /* Hard Back stays in TV mode. */
+-    CHECK(sent == 2 && match_frame(3, 12, 14) && equal(mode->text, "TV mode"));
++    CHECK(sent == 3 && match_frame(3, 12, 14) && equal(mode->text, "TV mode"));
+     press(0x800, 15);  /* Hard Home stays in TV mode. */
+-    CHECK(sent == 3 && match_frame(3, 13, 15) && equal(mode->text, "TV mode"));
++    CHECK(sent == 4 && match_frame(3, 13, 15) && equal(mode->text, "TV mode"));
+     press(0x1000, 60);  /* Existing stock TV Volume + */
+-    CHECK(sent == 4 && match_frame(3, 16, 60));
++    CHECK(sent == 5 && match_frame(3, 16, 60));
+     press(0x10000, 61); /* Existing stock TV Volume - */
+-    CHECK(sent == 5 && match_frame(3, 17, 61));
++    CHECK(sent == 6 && match_frame(3, 17, 61));
+     press(0x20000, 62); /* Existing stock TV Mute */
+-    CHECK(sent == 6 && match_frame(3, 15, 62));
+-    press(8, 16);      /* D returns locally and restores the Watch TV tile. */
++    CHECK(sent == 7 && match_frame(3, 15, 62));
++    press(8, 16);      /* D restores focus with no entry packet. */
++    CHECK(sent == 7 && equal(title->text, "Activities"));
++    press(0x200, 0x87abcdef);
++    CHECK(sent == 8 && match_event(2, 3, 0, 0x87abcdef));
++    press(8, 17);
++    CHECK(sent == 8);
+     CHECK(equal(title->text, "Activities") && equal(mode->text, "Menu mode"));
+     CHECK(equal(feedback->text, "\xef\x89\x80") && feedback->align == 2 &&
+           geometry(feedback, 198, 22, 28, 18));
+@@ -1099,7 +1117,7 @@
+           !layout_labels[FirstMark+1].hidden && layout_labels[FirstMark+2].hidden);
+     press(0x400, 19);
+     CHECK(equal(title->text, "Activities") && color_matches(slots[2].bg, 0xd772));
+-    CHECK(sent == 6 && errors == 0);
++    CHECK(sent == 8 && errors == 0);
+     return check_office_controls();
+ }
+ #else

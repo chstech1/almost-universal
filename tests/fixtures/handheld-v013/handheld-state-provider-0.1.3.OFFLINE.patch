@@ -1,0 +1,602 @@
+diff --git a/custom_components/ununiversal_remote/remote.py b/custom_components/ununiversal_remote/remote.py
+--- a/custom_components/ununiversal_remote/remote.py
++++ b/custom_components/ununiversal_remote/remote.py
+@@ -27,6 +27,7 @@
+     validate_menu,
+ )
+ from .protocol import compile_menu, decode_event
++from .state_provider import HAStateProvider
+ from .state_protocol import StateSession
+ from .stock import (
+     STOCK_HANDHELD_MODE, STOCK_MODES, STOCK_SAMPLES, URM1_MODE,
+@@ -223,14 +224,20 @@
+         climate = self.menu["screens"][screen_id]["climate"]
+         return self._temperature_status(climate) if climate else None
+ 
+-    def make_state_session(self, client, activation, send):
++    def make_state_session(self, client, activation, send, *, screens=None):
+         """Prepare a read-only view session for a separately verified carrier."""
+         if self.ble_mode != STOCK_HANDHELD_MODE or self.ble is None or activation is None:
+             return None
+         room = Field(1, "climate.home", "temperature", "current_temperature",
+                      self.hass.config.units.temperature_unit, "temperature_unit")
+-        session = StateSession(self.ble, client, activation, {4: (room,)}, self.hass.states.get, send)
++        session = StateSession(self.ble, client, activation,
++                               {4: (room,)} if screens is None else screens, self.hass.states.get, send)
+         return session if session.is_active() else None
++
++    def make_state_provider(self, client, activation, send, *, screens=None):
++        """Bind the offline state session to HA events without enabling a transport."""
++        session = self.make_state_session(client, activation, send, screens=screens)
++        return HAStateProvider(self.hass, self.entry, session) if session else None
+ 
+     def _temperature_status(self, climate):
+         state = self.hass.states.get(climate)
+diff --git a/custom_components/ununiversal_remote/state_protocol.py b/custom_components/ununiversal_remote/state_protocol.py
+--- a/custom_components/ununiversal_remote/state_protocol.py
++++ b/custom_components/ununiversal_remote/state_protocol.py
+@@ -1,15 +1,12 @@
+ """Offline logical stock handheld snapshots and deltas. No GATT carrier."""
+ 
+-from collections import deque
+-from decimal import Decimal, ROUND_HALF_UP
+ from struct import pack, unpack_from
+ 
+-from .view_state import ViewState
++from .view_state import TEMPERATURE_UNIT, ViewState
+ 
+ OPEN, SNAPSHOT, DELTA, CLOSE = 0x20, 0x21, 0x22, 0x23
+ CONTROL_PREFIX = bytes.fromhex("7e 00 00 00 55 52 01")
+ UPDATE_PREFIX = b"UR\x01"
+-TEMPERATURE_UNIT = {"°C": 1, "°F": 2}
+ 
+ 
+ def decode_view_control(frame):
+@@ -21,35 +18,26 @@
+     return kind, screen, generation
+ 
+ 
+-def _scaled_int(value, scale):
+-    scaled = Decimal(str(value)) * scale
+-    return int(scaled.to_integral_value(rounding=ROUND_HALF_UP))
+-
+-
+-def _encode_field(field, value):
++def _encode_field(value):
+     if value.available:
+-        if field.kind == "boolean":
++        if value.kind == "boolean":
+             return 1, bytes([value.value])
+-        if field.kind == "number" and -32768 <= value.value * field.scale <= 32767:
+-            return 2, pack("<h", _scaled_int(value.value, field.scale))
+-        if field.kind == "enum":
+-            index = field.values.index(value.value)
+-            if index <= 255:
+-                return 3, bytes([index])
+-        if (field.kind == "temperature" and isinstance(value.unit, str)
+-                and value.unit in TEMPERATURE_UNIT and -999.9 <= value.value <= 999.9):
+-            return 4, pack("<Bh", TEMPERATURE_UNIT[value.unit], _scaled_int(value.value, 10))
++        if value.kind == "number":
++            return 2, pack("<h", value.value)
++        if value.kind == "enum":
++            return 3, bytes([value.value])
++        if value.kind == "temperature":
++            return 4, pack("<Bh", TEMPERATURE_UNIT[value.unit], value.value)
+     return 0, b""
+ 
+ 
+-def encode_update(update, fields):
+-    schema = {field.id: field for field in fields}
++def encode_update(update):
+     data = bytearray(UPDATE_PREFIX + pack(
+         "<BBBIH", SNAPSHOT if update.snapshot else DELTA, update.screen,
+         len(update.fields), update.generation, update.sequence,
+     ))
+     for field_id, value in sorted(update.fields.items()):
+-        kind, encoded = _encode_field(schema[field_id], value)
++        kind, encoded = _encode_field(value)
+         data.extend((field_id, kind, len(encoded)))
+         data.extend(encoded)
+     if len(data) > 64:
+@@ -64,10 +52,9 @@
+         self._ble = ble
+         self._client = client
+         self._activation = activation
+-        self._screens = screens
+         self._send = send
+         self._sending = False
+-        self._recent = deque(maxlen=8)
++        self._generation = None
+         self.view = ViewState(screens, get_state)
+ 
+     def is_active(self):
+@@ -83,9 +70,12 @@
+         kind, screen, generation = control
+         if kind == CLOSE:
+             return self.view.close(screen, generation)
+-        if (screen, generation) in self._recent or not self.view.open(screen, generation):
++        # Subscription IDs advance modulo 32 bits within this connection.
++        if self._generation is not None and not 0 < (generation - self._generation) % 2**32 < 2**31:
+             return False
+-        self._recent.append((screen, generation))
++        if not self.view.open(screen, generation):
++            return False
++        self._generation = generation
+         return True
+ 
+     async def flush(self, now):
+@@ -96,7 +86,7 @@
+             return False
+         self._sending = True
+         try:
+-            await self._send(self._client, encode_update(update, self._screens[update.screen]))
++            await self._send(self._client, encode_update(update))
+         except BaseException:
+             self.view.close()
+             raise
+diff --git a/custom_components/ununiversal_remote/state_provider.py b/custom_components/ununiversal_remote/state_provider.py
+new file mode 100644
+--- /dev/null
++++ b/custom_components/ununiversal_remote/state_provider.py
+@@ -0,0 +1,91 @@
++"""Home Assistant event provider for an externally owned state session."""
++
++import asyncio
++import logging
++
++from homeassistant.core import callback
++from homeassistant.helpers.event import async_track_state_change_event
++
++LOGGER = logging.getLogger(__name__)
++
++
++class HAStateProvider:
++    """Subscribe only for the active view, with one timer and writer per link."""
++
++    def __init__(self, hass, entry, session):
++        self._hass = hass
++        self._entry = entry
++        self._session = session
++        self._unlisten = None
++        self._timer = None
++        self._task = None
++        self._closed = False
++
++    @callback
++    def async_receive(self, frame):
++        if self._closed or not self._session.is_active():
++            self.async_close()
++            return False
++        if not self._session.receive(frame):
++            return False
++        self._detach()
++        entities = self._session.view.entities
++        if entities:
++            self._unlisten = async_track_state_change_event(self._hass, entities, self._state_changed)
++        self._schedule()
++        return True
++
++    @callback
++    def async_close(self):
++        self._closed = True
++        self._detach()
++        self._session.view.close()
++        if self._task is not None:
++            self._task.cancel()
++
++    def _detach(self):
++        if self._unlisten is not None:
++            self._unlisten()
++            self._unlisten = None
++        if self._timer is not None:
++            self._timer.cancel()
++            self._timer = None
++
++    @callback
++    def _state_changed(self, event):
++        if not self._session.is_active():
++            self.async_close()
++            return
++        self._session.view.changed(event.data["entity_id"])
++        self._schedule()
++
++    def _schedule(self):
++        if self._closed or self._task is not None or self._timer is not None:
++            return
++        if (ready := self._session.view.ready_at) is not None:
++            loop = self._hass.loop
++            self._timer = loop.call_at(max(ready, loop.time()), self._start_flush)
++
++    @callback
++    def _start_flush(self):
++        self._timer = None
++        self._task = self._entry.async_create_task(self._hass, self._flush(), "handheld state reply")
++        self._task.add_done_callback(self._flushed)
++
++    async def _flush(self):
++        async with asyncio.timeout(2):
++            await self._session.flush(self._hass.loop.time())
++
++    @callback
++    def _flushed(self, task):
++        self._task = None
++        error = None if task.cancelled() else task.exception()
++        if self._closed:
++            return
++        if error is not None:
++            LOGGER.debug("Handheld state sender failed: %s", type(error).__name__)
++            self.async_close()
++        elif not self._session.is_active():
++            self.async_close()
++        else:
++            self._schedule()
+diff --git a/custom_components/ununiversal_remote/view_state.py b/custom_components/ununiversal_remote/view_state.py
+--- a/custom_components/ununiversal_remote/view_state.py
++++ b/custom_components/ununiversal_remote/view_state.py
+@@ -1,7 +1,10 @@
+ """Offline state projection from HA's registry into one active handheld view."""
+ 
+ from dataclasses import dataclass
++from decimal import Decimal, ROUND_HALF_UP
+ from math import isfinite
++
++TEMPERATURE_UNIT = {"°C": 1, "°F": 2}
+ 
+ 
+ @dataclass(frozen=True)
+@@ -14,6 +17,8 @@
+     unit_attribute: str | None = None
+     scale: int = 1
+     values: tuple[str, ...] = ()
++    minimum: int | float | None = None
++    maximum: int | float | None = None
+ 
+     def read(self, state):
+         if state is None or state.state in ("unknown", "unavailable"):
+@@ -29,14 +34,35 @@
+             )
+             or self.kind == "enum" and isinstance(value, str) and value in self.values
+         )
+-        return Value(self.kind, True, value, unit) if valid else Value(self.kind, False)
++        if not valid or (self.minimum is not None and value < self.minimum) or (
++            self.maximum is not None and value > self.maximum
++        ):
++            return Value(self.kind, False)
++        if self.kind == "temperature":
++            if not isinstance(unit, str) or unit not in TEMPERATURE_UNIT or not -999.9 <= value <= 999.9:
++                return Value(self.kind, False)
++            value = _quantize(value, 10)
++        elif self.kind == "number":
++            if not -32768 <= value * self.scale <= 32767:
++                return Value(self.kind, False)
++            value = _quantize(value, self.scale)
++        elif self.kind == "enum":
++            value = self.values.index(value)
++            if value > 255:
++                return Value(self.kind, False)
++        return Value(self.kind, True, value, unit if isinstance(unit, str) else None)
++
++
++def _quantize(value, scale):
++    return int((Decimal(str(value)) * scale).to_integral_value(rounding=ROUND_HALF_UP))
+ 
+ 
+ @dataclass(frozen=True)
+ class Value:
+     kind: str
+     available: bool
+-    value: bool | int | float | str | None = None
++    # Quantized display value. Temperature is tenths; other numbers use Field.scale.
++    value: bool | int | None = None
+     unit: str | None = None
+ 
+ 
+@@ -88,9 +114,15 @@
+         if entity_id in self.entities:
+             self._dirty = True
+ 
++    @property
++    def ready_at(self):
++        if self._dirty and self._sequence < 0xFFFF:
++            return self._last_sent + self._min_interval
++        return None
++
+     def take(self, now):
+         """Coalesce changes and sample the latest values at send time."""
+-        if not self._dirty or self._sequence == 0xFFFF or now < self._last_sent + self._min_interval:
++        if (ready_at := self.ready_at) is None or now < ready_at:
+             return None
+         screen, generation = self._view
+         self._dirty = False
+@@ -104,4 +136,3 @@
+         self._sequence += 1
+         self._last_sent = now
+         return Update(screen, generation, self._sequence, snapshot, fields)
+-
+diff --git a/tests/fixtures/state_handheld_bridge.c b/tests/fixtures/state_handheld_bridge.c
+new file mode 100644
+--- /dev/null
++++ b/tests/fixtures/state_handheld_bridge.c
+@@ -0,0 +1,27 @@
++/* Reuse the firmware team's host-only parser, never compile this into the DSP. */
++#include "climate_smoke.c"
++
++static struct readout sim;
++
++void sim_reset(void) { sim = (struct readout){0}; }
++void sim_open(uint8_t screen, uint32_t generation, uint8_t frame[REQUEST_SIZE])
++{
++    request_snapshot(&sim, screen, generation, frame);
++}
++void sim_close(uint8_t frame[REQUEST_SIZE]) { close_screen(&sim, frame); }
++void sim_link_lost(void) { sim.status = STALE; }
++int sim_receive(const uint8_t *data, size_t size) { return receive_state(&sim, data, size); }
++int sim_status(void) { return sim.status; }
++int sim_sequence(void) { return sim.sequence; }
++
++int sim_type(unsigned field) { return sim.fields[field - 1].type; }
++int sim_value(unsigned field)
++{
++    const struct field *item = &sim.fields[field - 1];
++    if (item->type == TEMPERATURE)
++        return signed_le16(item->value + 1);
++    if (item->type == NUMBER)
++        return signed_le16(item->value);
++    return item->value[0];
++}
++int sim_unit(unsigned field) { return sim.fields[field - 1].value[0]; }
+diff --git a/tests/test_offline_state_provider.py b/tests/test_offline_state_provider.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_offline_state_provider.py
+@@ -0,0 +1,250 @@
++"""Join real isolated HA state events to the actual DSP host parser."""
++
++import asyncio
++from ctypes import CDLL, c_char_p, c_size_t, c_uint8, c_uint32, create_string_buffer
++from os import environ
++from pathlib import Path
++from struct import pack
++from subprocess import run
++from tempfile import TemporaryDirectory
++from types import MappingProxyType, MethodType, SimpleNamespace
++from unittest import IsolatedAsyncioTestCase
++from unittest.mock import AsyncMock, patch
++
++from homeassistant.config_entries import ConfigEntry
++from homeassistant.core import HomeAssistant
++
++from custom_components.ununiversal_remote.ble import BleRemote
++from custom_components.ununiversal_remote.menu import DOMAIN
++from custom_components.ununiversal_remote.remote import Remote
++from custom_components.ununiversal_remote.state_protocol import CONTROL_PREFIX, OPEN
++from custom_components.ununiversal_remote.stock import STOCK_HANDHELD_MODE, V1_PREFIX
++from custom_components.ununiversal_remote.view_state import Field
++
++CLOSED, WAITING, CURRENT, STALE = range(4)
++
++
++class TestStateProvider(IsolatedAsyncioTestCase):
++    @classmethod
++    def setUpClass(cls):
++        build = TemporaryDirectory()
++        cls.addClassCleanup(build.cleanup)
++        candidate = Path(environ.get("HANDHELD_DSP_FIXTURE",
++            "firmware/dsp-v48-native-menu/climate_smoke.c")).resolve()
++        if not candidate.is_file() or candidate.name != "climate_smoke.c":
++            raise ValueError("Set HANDHELD_DSP_FIXTURE to the repository's climate_smoke.c")
++        binary = Path(build.name) / "receiver.so"
++        bridge = Path(__file__).parent / "fixtures" / "state_handheld_bridge.c"
++        run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC",
++             "-I", str(candidate.parent), str(bridge), "-o", str(binary)], check=True)
++        cls.native = CDLL(str(binary))
++        cls.native.sim_open.argtypes = [c_uint8, c_uint32, c_char_p]
++        cls.native.sim_close.argtypes = [c_char_p]
++        cls.native.sim_receive.argtypes = [c_char_p, c_size_t]
++
++    async def asyncSetUp(self):
++        self.native.sim_reset()
++        temp = TemporaryDirectory()
++        self.addCleanup(temp.cleanup)
++        self.hass = HomeAssistant(temp.name)
++        entry = ConfigEntry(title="Offline state", domain=DOMAIN, version=1, minor_version=1,
++            source="user", entry_id="offline_state", unique_id=None, discovery_keys=MappingProxyType({}),
++            subentries_data=(), data={"remote_id": "offline"}, options={"ble_mode": STOCK_HANDHELD_MODE})
++        self.remote = Remote(self.hass, entry)
++        self.ble = SimpleNamespace(client=None, active=None)
++        self.ble.is_active = MethodType(BleRemote.is_active, self.ble)
++        self.remote.ble = self.ble
++        self.frames = []
++        self.deliveries = []
++        self.drop_next = False
++        self.reconnect()
++        self.no_actions = AsyncMock(side_effect=AssertionError("State feed must never invoke a service"))
++        mock = patch.object(type(self.hass.services), "async_call", new=self.no_actions)
++        mock.start()
++        self.addCleanup(mock.stop)
++        self.action_events = []
++        self.addCleanup(self.hass.bus.async_listen("ununiversal_remote_input", self.action_events.append))
++
++    def reconnect(self, *, screens=None, sender=None):
++        peer = SimpleNamespace(is_connected=True)
++        self.client = self.ble.client = peer
++        self.ble.active = object()
++        self.provider = self.remote.make_state_provider(peer, self.ble.active, sender or self.send, screens=screens)
++        self.addCleanup(self.provider.async_close)
++        return self.provider
++
++    async def send(self, client, data):
++        assert client is self.client
++        self.frames.append((self.hass.loop.time(), data))
++        if self.drop_next:
++            self.drop_next = False
++            return
++        self.deliveries.append(bool(self.native.sim_receive(data, len(data))))
++
++    def open(self, screen, generation):
++        frame = create_string_buffer(14)
++        self.native.sim_open(screen, generation, frame)
++        self.assertTrue(self.provider.async_receive(frame.raw))
++        return frame.raw
++
++    def close(self):
++        frame = create_string_buffer(14)
++        self.native.sim_close(frame)
++        self.assertTrue(self.provider.async_receive(frame.raw))
++
++    async def wait_count(self, count):
++        async with asyncio.timeout(1.5):
++            while len(self.frames) < count:
++                await asyncio.sleep(0.005)
++
++    async def quiet(self, count):
++        await asyncio.sleep(0.28)
++        self.assertEqual(len(self.frames), count)
++
++    async def asyncTearDown(self):
++        self.provider.async_close()
++        await self.hass.async_block_till_done()
++        self.no_actions.assert_not_awaited()
++        self.assertEqual(self.action_events, [])
++
++    async def test_climate_bursts_units_unavailable_and_stale_resync(self):
++        change = self.hass.states.async_set
++        change("climate.home", "heat_cool", {"current_temperature": 68, "temperature_unit": "°F",
++                                             "target_temp_low": 65, "target_temp_high": 70})
++        self.open(4, 1)
++        await self.wait_count(1)
++        self.assertEqual((self.native.sim_status(), self.native.sim_type(1),
++                          self.native.sim_value(1), self.native.sim_unit(1)), (CURRENT, 4, 680, 2))
++        for n in range(100):
++            change("climate.home", "heat_cool", {"current_temperature": 69 + n/100,
++                                                 "temperature_unit": "°F", "target_temp_high": 70})
++        await self.wait_count(2)
++        self.assertEqual(self.native.sim_value(1), 700)
++        self.assertGreaterEqual(self.frames[1][0] - self.frames[0][0], 0.25)
++        change("climate.home", "heat_cool", {"current_temperature": 70.01, "temperature_unit": "°F"})
++        await self.quiet(2)
++        change("climate.home", "heat_cool", {"current_temperature": 21.5, "temperature_unit": "°C"})
++        await self.wait_count(3)
++        self.assertEqual((self.native.sim_type(1), self.native.sim_value(1), self.native.sim_unit(1)), (4, 215, 1))
++        change("climate.home", "heat_cool", {"current_temperature": 21.5, "temperature_unit": "K"})
++        await self.wait_count(4)
++        self.assertEqual(self.native.sim_type(1), 0)
++        change("climate.home", "unavailable", {"current_temperature": 21.5, "temperature_unit": "°C"})
++        await self.quiet(4)
++        change("climate.home", "heat", {"current_temperature": 21.5, "temperature_unit": "°C"})
++        await self.wait_count(5)
++        self.drop_next = True
++        change("climate.home", "heat", {"current_temperature": 21.7, "temperature_unit": "°C"})
++        await self.wait_count(6)
++        change("climate.home", "heat", {"current_temperature": 22, "temperature_unit": "°C"})
++        await self.wait_count(7)
++        self.assertFalse(self.deliveries[-1])
++        self.assertEqual((self.native.sim_status(), self.native.sim_value(1)), (STALE, 215))
++        self.open(4, 2)
++        await self.wait_count(8)
++        self.assertEqual((self.native.sim_status(), self.native.sim_sequence(), self.native.sim_value(1)),
++                         (CURRENT, 0, 220))
++
++    async def test_scope_switches_real_light_cover_and_fan_state_and_rejects_writes(self):
++        self.provider.async_close()
++        light, blinds, fan, climate = "light.living_room", "cover.living_room_blinds", "fan.ceiling", "climate.home"
++        screens = {
++            4: (Field(1, climate, "temperature", "current_temperature", "°F"),),
++            5: (Field(1, light, "boolean"), Field(2, light, "number", "brightness", minimum=0, maximum=255)),
++            6: (Field(1, blinds, "enum", values=("closed", "closing", "opening", "open")),
++                Field(2, blinds, "number", "current_position", "%", minimum=0, maximum=100)),
++            7: (Field(1, fan, "boolean"), Field(2, fan, "number", "percentage", "%", minimum=0, maximum=100)),
++        }
++        change = self.hass.states.async_set
++        change(climate, "heat_cool", {"current_temperature": 68, "target_temp_high": 71})
++        change(light, "on", {"brightness": 200})
++        change(blinds, "opening", {"current_position": 40})
++        change(fan, "on", {"percentage": 33})
++        self.reconnect(screens=screens)
++        self.open(5, 11)
++        await self.wait_count(1)
++        self.assertEqual((self.native.sim_value(1), self.native.sim_value(2)), (1, 200))
++        change(light, "off", {})
++        self.open(6, 12)
++        await self.wait_count(2)
++        self.assertEqual((self.native.sim_type(1), self.native.sim_value(1), self.native.sim_value(2)), (3, 2, 40))
++        for n in range(100):
++            change(light, "on", {"brightness": n})
++        await self.quiet(2)
++        change(blinds, "open", {"current_position": 60})
++        await self.wait_count(3)
++        self.assertEqual((self.native.sim_value(1), self.native.sim_value(2)), (3, 60))
++        self.open(7, 13)
++        await self.wait_count(4)
++        self.assertEqual((self.native.sim_value(1), self.native.sim_value(2)), (1, 33))
++        for n in range(100):
++            change(fan, "on", {"percentage": n})
++        await self.wait_count(5)
++        self.assertEqual(self.native.sim_value(2), 99)
++        change(fan, "on", {"percentage": 101})
++        await self.wait_count(6)
++        self.assertEqual(self.native.sim_type(2), 0)
++        for frame in (
++            CONTROL_PREFIX + pack("<BBBI", 0x24, 4, 0, 14),
++            CONTROL_PREFIX + pack("<BBBI", OPEN, 4, 1, 14),
++            CONTROL_PREFIX + pack("<BBBI", OPEN, 4, 0, 14) + b"climate.other",
++            CONTROL_PREFIX + pack("<BBBI", OPEN, 0xff, 0, 14),
++            V1_PREFIX + pack("<BBI", 3, 1, 42),
++        ):
++            self.assertFalse(self.provider.async_receive(frame))
++        self.assertEqual(self.hass.states.get(climate).attributes["target_temp_high"], 71)
++        self.close()
++        self.assertEqual(self.native.sim_status(), CLOSED)
++        change(fan, "off", {})
++        await self.quiet(6)
++        self.assertFalse(self.hass.bus.async_listeners().get("state_changed"))
++
++    async def test_link_loss_cancels_writer_and_requires_new_generation(self):
++        change = self.hass.states.async_set
++        change("climate.home", "heat", {"current_temperature": 68, "temperature_unit": "°F"})
++        self.provider.async_close()
++        entered, canceled = asyncio.Event(), asyncio.Event()
++
++        async def stall_after_snapshot(client, payload):
++            if payload[3] == 0x21:
++                await self.send(client, payload)
++                return
++            entered.set()
++            try:
++                await asyncio.Future()
++            finally:
++                canceled.set()
++
++        old = self.reconnect(sender=stall_after_snapshot)
++        first = self.open(4, 1)
++        await self.wait_count(1)
++        old_payload = self.frames[0][1]
++        change("climate.home", "heat", {"current_temperature": 69, "temperature_unit": "°F"})
++        await asyncio.wait_for(entered.wait(), 1.5)
++        self.client.is_connected = False
++        self.native.sim_link_lost()
++        old.async_close()
++        await asyncio.wait_for(canceled.wait(), 1.5)
++        self.assertFalse(self.hass.bus.async_listeners().get("state_changed"))
++        self.assertFalse(old.async_receive(first))
++        self.assertEqual((self.native.sim_status(), self.native.sim_value(1)), (STALE, 680))
++        change("climate.home", "heat", {"current_temperature": 70, "temperature_unit": "°F"})
++        self.reconnect()
++        await self.quiet(1)
++        self.open(4, 2)
++        self.assertFalse(self.native.sim_receive(old_payload, len(old_payload)))
++        await self.wait_count(2)
++        self.assertEqual((self.native.sim_status(), self.native.sim_sequence(), self.native.sim_value(1)),
++                         (CURRENT, 0, 700))
++        self.assertFalse(self.provider.async_receive(first))
++
++    async def test_old_generation_cannot_reopen_after_bursts_or_wrap(self):
++        self.hass.states.async_set("climate.home", "heat", {"current_temperature": 68, "temperature_unit": "°F"})
++        old = self.open(4, 0xfffffff9)
++        for gen in list(range(0xfffffffa, 2**32)) + list(range(8)):
++            self.open(4, gen)
++        self.assertFalse(self.provider.async_receive(old))
++        await self.wait_count(1)
++        self.assertEqual(self.native.sim_status(), CURRENT)
++        self.assertEqual(int.from_bytes(self.frames[0][1][6:10], "little"), 7)
++        await self.quiet(1)

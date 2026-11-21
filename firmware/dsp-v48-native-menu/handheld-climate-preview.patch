@@ -1,0 +1,136 @@
+--- a/firmware/dsp-v48-native-menu/handheld.c
++++ b/firmware/dsp-v48-native-menu/handheld.c
+@@ -18,11 +18,19 @@
+ };
+ 
+ static const struct screen screens[] = {
++#ifdef HANDHELD_POLISH
++    [ACTIVITIES] = {"Activities", {"Watch TV", "Room\ncontrols", "Scenes"}, 3, ACTIVITIES, 0},
++#else
+     [ACTIVITIES] = {"Activities", {"Watch TV", "Room controls", "Scenes"}, 3, ACTIVITIES, 0},
++#endif
+     [ROOM] = {"Room controls", {"Lights", "Climate", "Blinds"}, 3, ACTIVITIES, 1},
+     [SCENES] = {"Scenes", {"Movie night", "Evening"}, 2, ACTIVITIES, 2},
+     [LIGHTS] = {"Lights", {"Turn on", "Turn off"}, 2, ROOM, 0},
++#ifdef HANDHELD_POLISH
++    [CLIMATE] = {"Climate", {0}, 0, ROOM, 1},
++#else
+     [CLIMATE] = {"Climate", {"Lower heat", "Raise heat", "Lower cool", "Raise cool"}, 4, ROOM, 1},
++#endif
+     [BLINDS] = {"Blinds", {"Open", "Close", "Stop"}, 3, ROOM, 2},
+     [TV] = {"Watch TV", {0}, 0, ACTIVITIES, 0},
+ };
+@@ -114,6 +122,12 @@
+     bool tv = view == TV;
+     place(title, screen->title, 14, TITLE_Y, 212, TITLE_HEIGHT);
+     place(mode, tv ? "TV mode" : "Menu mode", 14, MODE_Y, 212, 22);
++#ifdef HANDHELD_POLISH
++    bool climate = view == CLIMATE;
++    if (climate)
++        place(feedback, "No reading yet", 14, 159, 212, 21);
++    else
++#endif
+     if (!tv && view >= SCENES)
+         place(feedback, "Set up in Home Assistant", 14, 253, 212, 21);
+     else
+@@ -124,15 +138,34 @@
+         struct stock_label *slot = stock_get_child(container, FIRST_SLOT_CHILD + i);
+         if (!slot)
+             break;
++#ifdef HANDHELD_POLISH
++        if (!tv && i >= (climate ? 2 : screen->count)) {
++#else
+         if (!tv && i >= screen->count) {
++#endif
+             stock_add_flag(slot, HIDDEN);
+             continue;
+         }
+         bool focused = !tv && i == handheld_state.focus;
++#ifdef HANDHELD_POLISH
++        stock_text_align(slot, climate ? LEFT_ALIGN : CENTER_ALIGN, MAIN);
++        stock_bg_color(slot, climate ? PANEL : focused ? FOCUS : TILE, MAIN);
++        stock_text_color(slot, climate && i == 0 ? SECONDARY : focused ? FOCUS_TEXT : PRIMARY, MAIN);
++        int padding = view == ACTIVITIES && i == 1 ? 14 : 22;
++        if (tv)
++            padding = 15;
++        stock_pad_top(slot, climate ? 0 : padding, MAIN);
++#else
+         stock_bg_color(slot, focused ? FOCUS : TILE, MAIN);
+         stock_text_color(slot, focused ? FOCUS_TEXT : PRIMARY, MAIN);
+         stock_pad_top(slot, tv ? 13 : TILE_PAD_TOP, MAIN);
++#endif
+         stock_radius(slot, tv ? 0 : TILE_RADIUS, MAIN);
++#ifdef HANDHELD_POLISH
++        if (climate)
++            place(slot, i ? "--" : "Current temperature", 14, i ? 132 : 105, 212, 20);
++        else
++#endif
+         if (tv)
+             place(slot, captions[i], 60 * i + CAPTION_INSET, 274, CAPTION_WIDTH, 46);
+         else
+--- a/firmware/dsp-v48-native-menu/smoke.c
++++ b/firmware/dsp-v48-native-menu/smoke.c
+@@ -311,7 +311,7 @@
+ #ifdef HANDHELD_POLISH
+ enum {
+     TitleY = 45, TitleHeight = 32, ModeY = 79,
+-    RowOne = 104, RowTwo = 171, TileHeight = 61, TilePad = 12, TileRadius = 5,
++    RowOne = 104, RowTwo = 171, TileHeight = 61, TilePad = 22, TileRadius = 5,
+     IdleFill = 0x1903, FooterX = 1, FooterWidth = 58,
+ };
+ #else
+@@ -339,7 +339,12 @@
+     CHECK(equal(title->text, "Activities") && geometry(title, 14, TitleY, 212, TitleHeight));
+     CHECK(equal(mode->text, "Menu mode") && geometry(mode, 14, ModeY, 212, 22));
+     CHECK(equal(slots[0].text, "Watch TV") && geometry(&slots[0], 14, RowOne, 103, TileHeight));
+-    CHECK(equal(slots[1].text, "Room controls") && geometry(&slots[1], 123, RowOne, 103, TileHeight));
++#ifdef HANDHELD_POLISH
++    CHECK(equal(slots[1].text, "Room\ncontrols") && slots[1].pad_top == 14);
++#else
++    CHECK(equal(slots[1].text, "Room controls"));
++#endif
++    CHECK(geometry(&slots[1], 123, RowOne, 103, TileHeight));
+     CHECK(equal(slots[2].text, "Scenes") && geometry(&slots[2], 14, RowTwo, 103, TileHeight) && slots[3].hidden);
+     CHECK(slots[0].bg == 0xd772 && slots[0].fg == 0x1922 &&
+           slots[1].bg == IdleFill && slots[1].fg == 0xf79d && slots[1].radius == TileRadius);
+@@ -351,11 +356,26 @@
+     press(0x200, 3);   /* Open Room controls, focus Climate, then open it. */
+     press(0x80, 4);
+     press(0x200, 5);
++#ifdef HANDHELD_POLISH
++    CHECK(equal(title->text, "Climate") && equal(slots[0].text, "Current temperature"));
++    CHECK(equal(slots[1].text, "--") && equal(feedback->text, "No reading yet"));
++    CHECK(geometry(&slots[0], 14, 105, 212, 20));
++    CHECK(geometry(&slots[1], 14, 132, 212, 20));
++    CHECK(slots[0].bg == 0x10a2 && slots[1].bg == 0x10a2 &&
++          slots[0].align == 1 && slots[1].align == 1 && slots[2].hidden && slots[3].hidden);
++    CHECK(geometry(feedback, 14, 159, 212, 21));
++    press(0x80, 50); press(0x200, 51); press(8, 52);
++    CHECK(equal(title->text, "Climate") && sent == 0);
++#else
+     CHECK(equal(title->text, "Climate") && equal(slots[3].text, "Raise cool"));
+     CHECK(geometry(&slots[3], 123, RowTwo, 103, TileHeight) && geometry(feedback, 14, 253, 212, 21));
+     CHECK(equal(feedback->text, "Set up in Home Assistant") && sent == 0);
++#endif
+     press(0x400, 6);
+     CHECK(equal(title->text, "Room controls") && slots[1].bg == 0xd772 && slots[3].hidden);
++#ifdef HANDHELD_POLISH
++    CHECK(slots[1].align == 2);
++#endif
+     press(0x400, 7);
+     CHECK(equal(title->text, "Activities") && slots[1].bg == 0xd772);
+ 
+@@ -371,7 +391,12 @@
+         CHECK(geometry(&slots[i], i * 60 + FooterX, 274, FooterWidth, 46) &&
+               equal(slots[i].text, captions[i]));
+         CHECK(slots[i].bg == IdleFill && slots[i].fg == 0xf79d &&
+-              slots[i].radius == 0 && slots[i].pad_top == 13);
++              slots[i].radius == 0);
++#ifdef HANDHELD_POLISH
++        CHECK(slots[i].pad_top == 15);
++#else
++        CHECK(slots[i].pad_top == 13);
++#endif
+     }
+ 
+     press(1, 13);      /* A Input sends a single Home Assistant report. */

@@ -1,0 +1,480 @@
+--- a/firmware/dsp-v48-native-menu/build.py
++++ b/firmware/dsp-v48-native-menu/build.py
+@@ -1,4 +1,4 @@
+-"""Build the offline Office-controls DSP against the exact working stock-operations image."""
++"""Build the offline Activities header against the exact Office-controls DSP."""
+ 
+ import argparse
+ import re
+@@ -18,6 +18,7 @@
+ SIM = 0x60000000
+ FACTORY_ENTRY, FACTORY_END = 0x2A884, 0x2C3DA
+ SET_TEXT_CALL, FRESH_CALL, REPORT_CALL = 0x3164F, 0xFF35, 0x50F4
++BATTERY_CALL = 0x506A
+ KEY_CALLBACK = 0x3145C
+ PAGE_TABLE = 0x647D8
+ FACTORY_TABLE = 0x472C0
+@@ -29,6 +30,9 @@
+ COLOR_DSP_SHA = "f15dcc1866ef59610c81489211dff0ec58c646fe17e8fb05135f96afabe6093c"
+ WORKING_ZIP_SHA = "9e2c5dfd15a6376a1d2b16754db5942615dd838d366fdcf23e472b91846407a4"
+ WORKING_DSP_SHA = "a2ab84a42622850d866f86ab26825e5eea0fd94a6514d1ce1bafffde05d2645e"
++
++OFFICE_ZIP_SHA = "b887ffddbef82a7ff78b23ee867b2424d2ce530754de32ffa82d76d3d9d3263c"
++OFFICE_DSP_SHA = "a114b96b245cd891562b7a6fb0956d62cedeb2231722ad3a7bfc270636517293"
+ 
+ SLOTS = {
+     "retired_audio": (0x271A4, 0x27405),
+@@ -75,6 +79,7 @@
+     "stock_bind_group": 0x40490,
+     "stock_close_page": 0x30148,
+     "stock_return_home": 0x24F68,
++    "stock_update_battery": 0x23ED8,
+ }
+ 
+ 
+@@ -179,7 +184,7 @@
+     candidate[offset:offset + 3] = instruction.to_bytes(3, "little")
+ 
+ 
+-def build(prefix, work, stock, reference, working):
++def build(prefix, work, stock, reference, working, office):
+     verify_retirements(stock, reference)
+     compile_c(prefix, work, "handheld")
+     symbols = link(prefix, work)
+@@ -193,12 +198,15 @@
+         require(candidate[offset] & 0x3f == 0x25, f"Expected pinned call8 at {offset:#x}")
+         patch_call(candidate, offset, candidate[offset:offset + 3].hex(), symbols[name])
+     patch_call(candidate, FRESH_CALL, "250425", symbols["splash_first_press"])
++    require(candidate[0x5054:0x506D] == stock[0x5054:0x506D] ==
++            office[0x5054:0x506D], "Stock status handler differs")
++    patch_call(candidate, BATTERY_CALL, "e5e61e", symbols["activities_battery_status"])
+     require(candidate[0x298B2:0x298B5].hex() == "25fd00", "Expected original factory constructor call")
+     displacement = symbols["factory_compact"] - BASE - FACTORY_ENTRY - 4
+     require(0 <= displacement < 0x20000, "Factory jump out of range")
+     redirect = (0x06 | (displacement << 6)).to_bytes(3, "little") + b"\xff"
+ 
+-    changed = [range(offset, offset + 3) for offset in (SET_TEXT_CALL, FRESH_CALL, REPORT_CALL)]
++    changed = [range(offset, offset + 3) for offset in (SET_TEXT_CALL, FRESH_CALL, REPORT_CALL, BATTERY_CALL)]
+     regions = {"extension": (FACTORY_ENTRY, FACTORY_END), **SLOTS}
+     for section, (start, end) in regions.items():
+         payload = work / f"{section}.bin"
+@@ -226,14 +234,15 @@
+                     for site in references(candidate, start, end)),
+                 "Stale reference to retired function interior outside approved patch sites")
+ 
+-    working_changes = [range(start, end) for start, end in regions.values()]
+-    working_changes.extend(range(offset, offset + 3) for offset in (SET_TEXT_CALL, REPORT_CALL, FRESH_CALL))
+-    working_changes.extend(range(slot, slot + 4) for slot, _, _, _, _ in RETIRED_PAGES.values())
+-    require(len(working) == len(candidate) and
+-            all(old == new or any(i in region for region in working_changes)
+-                for i, (old, new) in enumerate(zip(working, candidate))),
+-            "Unexpected difference outside the working image's existing repurposed regions and callbacks")
+-    print("Working-image diff verified. No widened flash span or newly retired stock region.")
++    office_changes = [range(start, end) for start, end in regions.values()]
++    office_changes.extend(range(offset, offset + 3) for offset in (SET_TEXT_CALL, REPORT_CALL, FRESH_CALL, BATTERY_CALL))
++    office_changes.extend(range(slot, slot + 4) for slot, _, _, _, _ in RETIRED_PAGES.values())
++    for name, baseline in (("Working stock operations", working), ("Office", office)):
++        require(len(baseline) == len(candidate) and
++                all(old == new or any(i in region for region in office_changes)
++                    for i, (old, new) in enumerate(zip(baseline, candidate))),
++                f"Unexpected difference outside the approved {name} diff")
++    print("Office-image diff verified. No widened flash span or newly retired stock region.")
+     return candidate, symbols
+ 
+ 
+@@ -258,6 +267,7 @@
+         "child_getter": candidate[0x412A0:0x412C1],
+         "fresh_call": candidate[FRESH_CALL:FRESH_CALL + 3],
+         "report_dispatch": candidate[0x50E8:0x50FC],
++        "battery_call": candidate[BATTERY_CALL - 3:BATTERY_CALL + 3],
+         "panel_fill": candidate[0x6230:0x62B3],
+         "panel_flush_tail": candidate[0xF76A:0xF776],
+         "stock_color_default": candidate[0x3F514:0x3F5FE],
+@@ -287,6 +297,7 @@
+         ("bubble_flag", 0x5108), ("fresh_call", FRESH_CALL - 7), ("factory_entry", FACTORY_ENTRY),
+         ("factory_dispatch", 0x29890), ("factory_table_literal", 0x29888), ("factory_table", FACTORY_TABLE),
+         ("nodev_callback", 0x40FB0), ("report_dispatch", 0x50E8), ("stock_reset_idle", 0x22D94),
++        ("battery_call", BATTERY_CALL - 6),
+         ("panel_alloc_literals", 0x47B8), ("panel_io_literals", 0x6220), ("panel_fill", 0x6230),
+         ("panel_flush_tail", 0xF76A - 7), ("stock_color_default", 0x3F514),
+         ("page_lookup", 0x30049 - 5), ("page_table_literal", 0x30030), ("page_table", PAGE_TABLE),
+@@ -296,14 +307,15 @@
+     ]
+     test_symbols = link(prefix, work, sections)
+     for name in ("native_menu_create", "handheld_report", "splash_first_press", "factory_compact",
+-                 "audio_notice", "fan_notice", "climate_render_value", "unpack_splash"):
++                 "audio_notice", "fan_notice", "climate_render_value", "unpack_splash",
++                 "activities_battery_status"):
+         require(test_symbols[name] - SIM == symbols[name] - BASE, f"Fixture changed address of {name}")
+     status = run(["qemu-system-xtensa", "-M", "sim", "-cpu", "de212", "-m", "16M", "-display", "none",
+                   "-monitor", "none", "-serial", "none", "-semihosting",
+                   "-device", "loader,file=menu.elf,cpu-num=0"], cwd=work, timeout=10)
+     require(not status.returncode, f"Xtensa fixture stopped with assertion code {status.returncode}")
+-    print("Xtensa fixture passed: exact indexed splash, first-frame and input checks, stock flush,"
+-          " Office labels/Back and all action packets, TV compatibility and Climate readout")
++    print("Xtensa fixture passed: compact Activities layout and stock battery call-through,"
++          " exact indexed splash, stock flush, Office and TV action packets, and Climate readout")
+ 
+ 
+ def load(path, zip_hash, dsp_hash, *, only_dsp=False):
+@@ -321,6 +333,7 @@
+     parser.add_argument("color_baseline", type=Path)
+     parser.add_argument("stock_v48", type=Path)
+     parser.add_argument("working_stock_ops", type=Path)
++    parser.add_argument("office_baseline", type=Path)
+     parser.add_argument("approved_png", type=Path)
+     parser.add_argument("--tool-prefix", default="xtensa-esp32-elf")
+     parser.add_argument("--output", type=Path, help="optional new .OFFLINE.zip after successful QEMU")
+@@ -331,10 +344,11 @@
+     stock = load(args.stock_v48, STOCK_ARCHIVE_SHA, STOCK_DSP_SHA)
+     reference = load(args.color_baseline, COLOR_ZIP_SHA, COLOR_DSP_SHA, only_dsp=True)
+     working = load(args.working_stock_ops, WORKING_ZIP_SHA, WORKING_DSP_SHA, only_dsp=True)
++    office = load(args.office_baseline, OFFICE_ZIP_SHA, OFFICE_DSP_SHA, only_dsp=True)
+     with TemporaryDirectory(prefix="full-splash-proof-") as directory:
+         work = Path(directory)
+         prepare(args.approved_png, work)
+-        candidate, symbols = build(prefix, work, stock, reference, working)
++        candidate, symbols = build(prefix, work, stock, reference, working, office)
+         run([f"{prefix}-size", "-A", "handheld.o"], cwd=work, check=True)
+         print((work / "handheld.su").read_text(), flush=True)
+         smoke(prefix, work, candidate, symbols)
+--- a/firmware/dsp-v48-native-menu/handheld.c
++++ b/firmware/dsp-v48-native-menu/handheld.c
+@@ -87,6 +87,7 @@
+     NOTE_CHILD = FIRST_SLOT_CHILD + 4, BODY_CHILD, FIRST_MARK_CHILD, SPLASH_CHILD = NOTE_CHILD,
+     SPLASH_VISIBLE = 1, SPLASH_SHOWN = 2, IMAGE_DELETE = 0x21,
+     SPLASH_NAVY = NATIVE_RGB565(0x08a5),
++    BATTERY_LOW = NATIVE_RGB565(0xfe93),
+ };
+ 
+ #ifdef HANDHELD_POLISH
+@@ -94,6 +95,7 @@
+     TILE = NATIVE_RGB565(0x1903), TITLE_Y = 45, TITLE_HEIGHT = 32, MODE_Y = 79,
+     GRID_Y = 104, TILE_HEIGHT = 61, ROW_PITCH = 67, TILE_PAD_TOP = 22, TILE_RADIUS = 5,
+     CAPTION_INSET = 1, CAPTION_WIDTH = 58,
++    ACTIVITIES_TOP = 14, ACTIVITIES_MODE = 50, ACTIVITIES_GRID = 78,
+ };
+ extern const uint8_t stock_compact_font[];
+ #else
+@@ -187,6 +189,46 @@
+     return parent;
+ }
+ 
++static const char battery_glyphs[][4] __attribute__((section(".retired_audio.art"))) = {
++    "\xef\x89\x84", "\xef\x89\x83", "\xef\x89\x82", "\xef\x89\x81", "\xef\x89\x80",
++};
++
++__attribute__((noinline, section(".retired_audio")))
++static void draw_battery(struct stock_label *label)
++{
++    unsigned icon = handheld_state.battery_icon;
++    if (icon) {
++        stock_text_align(label, CENTER_ALIGN, MAIN);
++        stock_text_color(label, icon & 8 ? BATTERY_LOW : SECONDARY, MAIN);
++        place(label, battery_glyphs[(icon & 7) - 1], 198, 22, 28, 18);
++    } else {
++        stock_add_flag(label, HIDDEN);
++    }
++}
++
++extern void stock_update_battery(uint8_t percent);
++
++__attribute__((section(".retired_audio")))
++void activities_battery_status(uint8_t percent)
++{
++    stock_update_battery(percent);
++    unsigned icon = 0;
++    if (percent <= 100) {
++        icon = 1 + (percent >= 13) + (percent >= 38) + (percent >= 63) + (percent >= 88);
++        if (percent <= 20)
++            icon |= 8;
++    }
++    if (icon == handheld_state.battery_icon)
++        return;
++    handheld_state.battery_icon = icon;
++    if (handheld_state.startup == SPLASH_SHOWN && handheld_state.view == ACTIVITIES && nodev_active()) {
++        struct stock_label *label = stock_get_child(stock_nodev.container, FEEDBACK_CHILD);
++        if (label)
++            draw_battery(label);
++    }
++}
++
++__attribute__((noinline, section(".retired_fan")))
+ static void draw_decoration(void *container, unsigned view)
+ {
+     struct stock_label *note = stock_get_child(container, NOTE_CHILD);
+@@ -208,7 +250,7 @@
+             unsigned shape = view == COVERS ? 5 : 3 * view + i;
+             unsigned mark = 2 * shape + (i == handheld_state.focus);
+             stock_image_set_source(image, &marks[mark]);
+-            int y = i < 2 ? 112 : (view == ACTIVITIES ? 186 : 179);
++            int y = view == ACTIVITIES ? (i < 2 ? 86 : 160) : (i < 2 ? 112 : 179);
+             stock_set_position(image, 23 + (i % 2) * 109, y);
+         } else if (view == TV && i == 0) {
+             stock_image_set_source(image, &marks[TV_MARK]);
+@@ -236,8 +278,15 @@
+     const struct screen *screen = &screens[view];
+     bool tv = view == TV;
+     bool device = wire_screen[view] != 0;
+-    place(title, screen->title, 14, TITLE_Y, 212, TITLE_HEIGHT);
+-    place(mode, tv ? "TV mode" : device ? "Device mode" : "Menu mode", 14, MODE_Y, 212, 22);
++    bool activities = view == ACTIVITIES;
++    place(title, screen->title, 14, activities ? ACTIVITIES_TOP : TITLE_Y,
++          activities ? 174 : 212, TITLE_HEIGHT);
++    place(mode, tv ? "TV mode" : device ? "Device mode" : "Menu mode",
++          14, activities ? ACTIVITIES_MODE : MODE_Y, 212, 22);
++    if (!activities) {
++        stock_text_align(feedback, LEFT_ALIGN, MAIN);
++        stock_text_color(feedback, SECONDARY, MAIN);
++    }
+     bool climate = view == CLIMATE;
+     if (tv)
+         place(feedback, "Hard Back and Home\nstay in TV mode", 14, 189, 212, 36);
+@@ -245,6 +294,8 @@
+         place(feedback, "No reading yet", 14, 159, 212, 21);
+     else if (view == SCENES)
+         place(feedback, "Set up in Home Assistant", 14, 253, 212, 21);
++    else if (activities)
++        draw_battery(feedback);
+     else
+         stock_add_flag(feedback, HIDDEN);
+ 
+@@ -263,7 +314,6 @@
+         stock_text_align(slot, climate || artwork ? LEFT_ALIGN : CENTER_ALIGN, MAIN);
+         stock_bg_color(slot, climate ? PANEL : focused ? FOCUS : TILE, MAIN);
+         stock_text_color(slot, climate && !i ? SECONDARY : focused ? FOCUS_TEXT : PRIMARY, MAIN);
+-        bool activities = view == ACTIVITIES;
+         stock_pad_left(slot, artwork ? 9 : 0, MAIN);
+         stock_pad_top(slot, climate ? 0 : device ? 7 : i == 3 ? 11 : 28, MAIN);
+         stock_radius(slot, device || climate ? 0 : TILE_RADIUS, MAIN);
+@@ -273,7 +323,8 @@
+             place(slot, captions[i], 60 * i + CAPTION_INSET, 274, CAPTION_WIDTH, 46);
+         else
+             place(slot, tiles[screen->first_tile + i], 14 + (i % 2) * 109,
+-                  i < 2 ? GRID_Y : GRID_Y + (activities ? 74 : ROW_PITCH),
++                  activities ? ACTIVITIES_GRID + (i < 2 ? 0 : 74) :
++                               GRID_Y + (i < 2 ? 0 : ROW_PITCH),
+                   103, activities && i < 2 ? 68 : TILE_HEIGHT);
+     }
+     draw_decoration(container, view);
+--- a/firmware/dsp-v48-native-menu/menu.h
++++ b/firmware/dsp-v48-native-menu/menu.h
+@@ -36,8 +36,9 @@
+ #ifdef HANDHELD
+ /* The native menu can use one alignment word cleared at DSP startup. */
+ struct handheld_ram {
+-    uint8_t view;
+-    uint8_t focus;
++    uint8_t view : 4;
++    uint8_t focus : 2;
++    uint8_t battery_icon;  /* Zero until a valid stock status report. */
+     uint8_t transition_key;
+     uint8_t startup;
+ };
+--- a/firmware/dsp-v48-native-menu/proof_marks.inc
++++ b/firmware/dsp-v48-native-menu/proof_marks.inc
+@@ -52,14 +52,14 @@
+     0x00, 0x00, 0x00, 0x00, 0x15, 0x54, 0x00, 0x00, 0x00, 0x00, 0x15, 0x54, 0x00, 0x00, 0x00, 0x00,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+ };
+-static const uint8_t nested_mark_0[] __attribute__((section(".retired_fan.art"))) = {
++static const uint8_t nested_mark_0[] __attribute__((section(".retired_audio.art"))) = {
+     0x18, 0x20, 0x18, 0xff, 0xac, 0xb6, 0xac, 0xff, 0xac, 0xb6, 0xac, 0xff, 0xac, 0xb6, 0xac, 0xff,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x15, 0x54, 0x00, 0x00, 0x50, 0x05, 0x00,
+     0x00, 0x40, 0x01, 0x00, 0x01, 0x40, 0x01, 0x40, 0x01, 0x40, 0x01, 0x40, 0x00, 0x40, 0x01, 0x00,
+     0x00, 0x50, 0x05, 0x00, 0x00, 0x15, 0x54, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x05, 0x50, 0x00,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x05, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00,
+ };
+-static const uint8_t nested_mark_1[] __attribute__((section(".retired_fan.art"))) = {
++static const uint8_t nested_mark_1[] __attribute__((section(".retired_dump.art"))) = {
+     0x94, 0xee, 0xd5, 0xff, 0x10, 0x24, 0x18, 0xff, 0x10, 0x24, 0x18, 0xff, 0x10, 0x24, 0x18, 0xff,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x15, 0x54, 0x00, 0x00, 0x50, 0x05, 0x00,
+     0x00, 0x40, 0x01, 0x00, 0x01, 0x40, 0x01, 0x40, 0x01, 0x40, 0x01, 0x40, 0x00, 0x40, 0x01, 0x00,
+--- a/firmware/dsp-v48-native-menu/smoke.S
++++ b/firmware/dsp-v48-native-menu/smoke.S
+@@ -139,6 +139,15 @@
+ stock_dispatch_report:
+     .incbin "report_dispatch.bin"
+ 
++.section .battery_call,"ax",@progbits
++.global stock_battery_report
++stock_battery_report:
++    entry a1, 32
++    .incbin "battery_call.bin"
++    retw.n
++
++trampoline stock_update_battery, stock_update_battery, fixture_update_battery
++
+ return_value stock_reset_idle, 0
+ trampoline stock_normalize, stock_normalize, fixture_normalize
+ trampoline stock_ipc_send, stock_ipc_send, fixture_ipc_send
+--- a/firmware/dsp-v48-native-menu/smoke.c
++++ b/firmware/dsp-v48-native-menu/smoke.c
+@@ -69,6 +69,7 @@
+     void (*on_delete)(const struct stock_event *);
+     const void *delete_data;
+ } layout_labels[14];
++static unsigned feedback_writes;
+ const uint8_t stock_image_class[] = {3};
+ extern const uint8_t original_splash_pixels[];
+ extern int stock_indexed_palette(const struct image_desc *, uint16_t *, uint8_t *);
+@@ -146,6 +147,8 @@
+             target->text = child->text;
+             if (!i)
+                 ++changes;
++            if (i == 2)
++                ++feedback_writes;
+             return;
+         }
+     }
+@@ -462,7 +465,8 @@
+ }
+ static uint8_t last_frame[13];
+ static const uint8_t *expected_raw;
+-static unsigned normalized, sent;
++static unsigned normalized, sent, battery_updates;
++static uint8_t battery_argument;
+ 
+ struct report_message {
+     uint32_t header[2];
+@@ -471,6 +475,19 @@
+ };
+ 
+ extern void stock_dispatch_report(const struct report_message *report);
++extern void stock_battery_report(const struct report_message *report);
++
++void fixture_update_battery(uint8_t percent)
++{
++    battery_argument = percent;
++    ++battery_updates;
++}
++
++static void battery_report(uint8_t percent)
++{
++    const struct report_message report = {.length = 0x19, .raw = {percent}};
++    stock_battery_report(&report);
++}
+ 
+ void fixture_normalize(const uint8_t *raw)
+ {
+@@ -541,8 +558,8 @@
+ enum {
+     MenuTitle = 0, PanelNote = 7, PanelBody = 8, FirstMark = 9, FirstCrop = 7,
+     MenuChildCount = 14, SplashChildCount = 12, FirstCropChild = 9,
+-    TitleY = 45, TitleHeight = 32, ModeY = 79,
+-    RowOne = 104, RowTwo = 178, TileHeight = 61, TilePad = 28, TileRadius = 5,
++    TitleHeight = 32,
++    RowOne = 78, RowTwo = 152, TileHeight = 61, TilePad = 28, TileRadius = 5,
+     IdleFill = 0x1903, FooterX = 1, FooterWidth = 58,
+ };
+ #else
+@@ -878,6 +895,10 @@
+     CHECK(spec.count == MenuChildCount && !allocated && equal(layout_labels[0].text, "Activities"));
+     raw_report(10, 1, 2, 0, 0xf4);
+     raw_report(10, 0, 0, 0, 0xf5);
++    struct layout_label *startup_battery = &layout_labels[2];
++    CHECK(startup_battery->hidden);
++    battery_report(82);
++    CHECK(!startup_battery->hidden && equal(startup_battery->text, "\xef\x89\x81"));
+     unsigned before = changes;
+     timer_tick(3000);
+     timer_tick(6000);
+@@ -889,7 +910,11 @@
+     reset_splash_fixture();
+     stock_initial_label(&label, "LCD CHECK.");
+     CHECK(allocated == 5744 && proof_timer.callback);
++    battery_report(0);
++    CHECK(startup_battery->hidden && battery_argument == 0);
+     timer_tick(3000);
++    CHECK(!startup_battery->hidden && equal(startup_battery->text, "\xef\x89\x84"));
++    CHECK(color_matches(startup_battery->fg, 0xfe93));
+     CHECK(timer_runs == 2 && !allocated && spec.count == MenuChildCount);
+     spec.count = 2;
+     stock_initial_label(&label, "LCD CHECK.");
+@@ -938,8 +963,37 @@
+ #endif
+     CHECK(spec.count == MenuChildCount && color_matches(panel_bg, 0x10a2) && panel_opacity == 255);
+     CHECK(icon_hidden && initial_label_hidden && feedback->hidden);
+-    CHECK(equal(title->text, "Activities") && geometry(title, 14, TitleY, 212, TitleHeight));
+-    CHECK(equal(mode->text, "Menu mode") && geometry(mode, 14, ModeY, 212, 22));
++    static const struct {
++        uint8_t percent, glyph;
++        uint16_t color;
++    } gauge[] = {
++        {0, 0x84, 0xfe93}, {12, 0x84, 0xfe93}, {13, 0x83, 0xfe93},
++        {20, 0x83, 0xfe93}, {21, 0x83, 0xadb5}, {37, 0x83, 0xadb5},
++        {38, 0x82, 0xadb5}, {62, 0x82, 0xadb5}, {63, 0x81, 0xadb5},
++        {87, 0x81, 0xadb5}, {88, 0x80, 0xadb5}, {100, 0x80, 0xadb5},
++    };
++    unsigned updates = battery_updates;
++    for (unsigned i = 0; i < sizeof gauge / sizeof gauge[0]; ++i) {
++        char glyph[] = {0xef, 0x89, (char)gauge[i].glyph, 0};
++        battery_report(gauge[i].percent);
++        CHECK(battery_updates == updates + i + 1 && battery_argument == gauge[i].percent);
++        CHECK(!feedback->hidden && equal(feedback->text, glyph) && feedback->align == 2 &&
++              geometry(feedback, 198, 22, 28, 18) && color_matches(feedback->fg, gauge[i].color));
++    }
++    battery_report(101);
++    CHECK(feedback->hidden && battery_argument == 101);
++    battery_report(20);
++    unsigned redraws = feedback_writes;
++    battery_report(18); /* Same glyph and amber color. */
++    CHECK(feedback_writes == redraws && battery_argument == 18);
++    active_page = "charge";
++    battery_report(82);
++    CHECK(feedback_writes == redraws && battery_argument == 82);
++    active_page = stock_nodev_name;
++    battery_report(20);
++    CHECK(feedback_writes == redraws + 1);
++    CHECK(equal(title->text, "Activities") && geometry(title, 14, 14, 174, TitleHeight));
++    CHECK(equal(mode->text, "Menu mode") && geometry(mode, 14, 50, 212, 22));
+     CHECK(color_matches(title->fg, 0xf79d) && color_matches(mode->fg, 0xadb5));
+     CHECK(equal(slots[0].text, "Watch TV") && geometry(&slots[0], 14, RowOne, 103, 68));
+     CHECK(equal(slots[1].text, "Room\ncontrols") && slots[1].pad_top == 28 && geometry(&slots[1], 123, RowOne, 103, 68));
+@@ -948,7 +1002,7 @@
+           color_matches(slots[1].bg, IdleFill) && color_matches(slots[1].fg, 0xf79d) &&
+           slots[1].radius == TileRadius);
+     CHECK(layout_labels[FirstMark].image && layout_labels[FirstMark].image->data_size == 80 &&
+-          !layout_labels[FirstMark].hidden && layout_labels[FirstMark].x == 23 && layout_labels[FirstMark].y == 112);
++          !layout_labels[FirstMark].hidden && layout_labels[FirstMark].x == 23 && layout_labels[FirstMark].y == 86);
+     const struct image_desc *focused_mark = layout_labels[FirstMark].image;
+     CHECK(slots[0].align == 1 && slots[0].pad_left == 9 && slots[0].opacity == 255 && slots[0].pad_top == TilePad);
+ 
+@@ -967,6 +1021,9 @@
+     CHECK(geometry(&slots[0], 14, 105, 212, 20));
+     CHECK(geometry(&slots[1], 14, 132, 212, 20) && equal(slots[1].text, "--"));
+     CHECK(geometry(feedback, 14, 159, 212, 21) && equal(feedback->text, "No reading yet"));
++    CHECK(feedback->align == 1 && color_matches(feedback->fg, 0xadb5));
++    battery_report(82);
++    CHECK(equal(feedback->text, "No reading yet") && geometry(feedback, 14, 159, 212, 21));
+     CHECK(color_matches(slots[0].bg, 0x10a2) && slots[0].align == 1 && slots[2].hidden && slots[3].hidden);
+     climate_render_value("68.0\xc2\xb0" "F", false);
+     CHECK(equal(slots[1].text, "68.0\xc2\xb0" "F") && !*feedback->text);
+@@ -987,6 +1044,8 @@
+     CHECK(equal(slots[1].text, "Climate"));
+     press(0x400, 7);
+     CHECK(equal(title->text, "Activities") && color_matches(slots[1].bg, 0xd772));
++    CHECK(equal(feedback->text, "\xef\x89\x81") && feedback->align == 2 &&
++          geometry(feedback, 198, 22, 28, 18));
+ 
+     press(0x100, 8);
+     press(0x200, 9);   /* Open TV mode. */
+@@ -996,6 +1055,9 @@
+     CHECK(equal(title->text, "Watch TV") && equal(mode->text, "TV mode") && sent == 0);
+     CHECK(equal(feedback->text, "Hard Back and Home\nstay in TV mode") &&
+           geometry(feedback, 14, 189, 212, 36));
++    CHECK(feedback->align == 1 && color_matches(feedback->fg, 0xadb5));
++    battery_report(100);
++    CHECK(equal(feedback->text, "Hard Back and Home\nstay in TV mode"));
+     CHECK(geometry(&layout_labels[PanelNote], 14, 106, 212, 73) &&
+           equal(layout_labels[PanelNote].text, "TV controls"));
+     CHECK(geometry(&layout_labels[PanelBody], 26, 141, 152, 36) &&
+@@ -1026,6 +1088,8 @@
+     CHECK(sent == 6 && match_frame(3, 15, 62));
+     press(8, 16);      /* D returns locally and restores the Watch TV tile. */
+     CHECK(equal(title->text, "Activities") && equal(mode->text, "Menu mode"));
++    CHECK(equal(feedback->text, "\xef\x89\x80") && feedback->align == 2 &&
++          geometry(feedback, 198, 22, 28, 18));
+     CHECK(geometry(&slots[0], 14, RowOne, 103, 68) &&
+           color_matches(slots[0].bg, 0xd772) && slots[3].hidden);
+     press(0x2000, 17); /* Move to Scenes and verify both nested mark objects. */

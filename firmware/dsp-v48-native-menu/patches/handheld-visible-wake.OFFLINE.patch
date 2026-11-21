@@ -1,0 +1,417 @@
+--- a/firmware/dsp-v48-native-menu/build.py
++++ b/firmware/dsp-v48-native-menu/build.py
+@@ -1,4 +1,4 @@
+-"""Build the offline Activities header against the exact Office-controls DSP."""
++"""Build the offline visible wake diagnostic against the exact Activities header."""
+ 
+ import argparse
+ import re
+@@ -19,6 +19,8 @@
+ FACTORY_ENTRY, FACTORY_END = 0x2A884, 0x2C3DA
+ SET_TEXT_CALL, FRESH_CALL, REPORT_CALL = 0x3164F, 0xFF35, 0x50F4
+ BATTERY_CALL = 0x506A
++DSP_ENTRY, RELOCATE_CALL, ENTRY_TRACE = 0x1FC48, 0x1FC4E, 0x6F884
++MENU_RAM = 0x0018342C
+ KEY_CALLBACK = 0x3145C
+ PAGE_TABLE = 0x647D8
+ FACTORY_TABLE = 0x472C0
+@@ -33,6 +35,9 @@
+ 
+ OFFICE_ZIP_SHA = "b887ffddbef82a7ff78b23ee867b2424d2ce530754de32ffa82d76d3d9d3263c"
+ OFFICE_DSP_SHA = "a114b96b245cd891562b7a6fb0956d62cedeb2231722ad3a7bfc270636517293"
++
++HEADER_ZIP_SHA = "0ab181911b1982c0b8791ef1518977f652a67fade37f2f41bbd2923d38a4fbe2"
++HEADER_DSP_SHA = "8844d43533a77ed06f219ce1c927d9492fda9b3181917300197e248e6e99fcd6"
+ 
+ SLOTS = {
+     "retired_audio": (0x271A4, 0x27405),
+@@ -80,6 +85,7 @@
+     "stock_close_page": 0x30148,
+     "stock_return_home": 0x24F68,
+     "stock_update_battery": 0x23ED8,
++    "stock_relocate": 0x1E714,
+ }
+ 
+ 
+@@ -106,7 +112,7 @@
+             "stock_set_text = 0x2001d554;", "stock_get_child = 0x200412a0;",
+             "stock_event_add = 0x20034840;", "stock_group_send = 0x20034f78;",
+             "stock_nodev_name = 0x20060690;", "stock_page_manager = 0x001ca330;",
+-            "handheld_state = 0x0018342c;", "stock_menu_font = 0x001ca068;",
++            f"handheld_state = {MENU_RAM:#x};", "stock_menu_font = 0x001ca068;",
+             "stock_compact_font = 0x20060a70;", "stock_image_class = 0x2004ce78;",
+             "stock_audio_notice = 0x001ca0f8;", "stock_fan_notice = 0x001ca25c;",
+             "stock_audio_name = 0x20060684;", "stock_fan_name = 0x2006067c;",
+@@ -114,8 +120,9 @@
+         layout.extend(f"{name} = {BASE + offset:#x};" for name, offset in CALLS.items())
+     layout.append("SECTIONS {")
+     layout.extend(f"  .{name} {SIM + address:#x} : {{ *(.{name}) }}" for name, address in sections)
+-    layout.extend(f"  .{name} {base + start:#x} : {{ handheld.o(.{name} .{name}.art) }}"
+-                  for name, (start, _) in SLOTS.items())
++    for name, (start, _) in SLOTS.items():
++        wake = " wake.o(.wake_entry)" if name == "retired_dump" else ""
++        layout.append(f"  .{name} {base + start:#x} : {{ handheld.o(.{name} .{name}.art){wake} }}")
+     layout.append(f"  .extension {base + FACTORY_ENTRY + 4:#x} : {{ handheld.o(.literal* .text* .rodata*) }}")
+     if fixture:
+         layout.append("  .fixture 0x60075000 : { smoke.o(.literal* .text* .rodata*) }")
+@@ -124,7 +131,9 @@
+         layout.append('  ASSERT(SIZEOF(.data) == 0 && SIZEOF(.bss) == 0, "unexpected menu RAM")')
+     layout.extend(["  /DISCARD/ : { *(.comment .note* .eh_frame*) }", "}"])
+     (work / "layout.ld").write_text("\n".join(layout))
+-    objects = ["handheld.o", "start.o", "smoke.o"] if fixture else ["handheld.o"]
++    objects = ["handheld.o", "wake.o"]
++    if fixture:
++        objects.extend(["start.o", "smoke.o"])
+     run([f"{prefix}-ld", "-EL", "--no-relax", "-T", "layout.ld", "-o", "menu.elf", *objects],
+         cwd=work, check=True)
+     lines = run([f"{prefix}-nm", "--defined-only", "menu.elf"], cwd=work, check=True,
+@@ -184,9 +193,18 @@
+     candidate[offset:offset + 3] = instruction.to_bytes(3, "little")
+ 
+ 
+-def build(prefix, work, stock, reference, working, office):
++def build(prefix, work, stock, reference, working, office, header):
+     verify_retirements(stock, reference)
++    require(unpack_from("<I", stock, 0x1E6E4)[0] == MENU_RAM and
++            unpack_from("<I", stock, 0x1E700)[0] == MENU_RAM + 4 and
++            unpack_from("<I", header, 0x1E700)[0] == MENU_RAM,
++            "Expected the existing menu word between stock initialized data and BSS")
++    require(header[DSP_ENTRY:RELOCATE_CALL + 3] == reference[DSP_ENTRY:RELOCATE_CALL + 3] ==
++            bytes.fromhex("364100 a5c34f 65acfe") and
++            stock[RELOCATE_CALL:RELOCATE_CALL + 3] == bytes.fromhex("65acfe"),
++            "Expected the existing UART checkpoint and unchanged stock relocation call")
+     compile_c(prefix, work, "handheld")
++    run([f"{prefix}-as", "--no-transform", "-o", "wake.o", HERE / "wake.S"], cwd=work, check=True)
+     symbols = link(prefix, work)
+     instructions = run([f"{prefix}-objdump", "-d", "menu.elf"], cwd=work, check=True,
+                        capture_output=True, text=True).stdout
+@@ -201,19 +219,20 @@
+     require(candidate[0x5054:0x506D] == stock[0x5054:0x506D] ==
+             office[0x5054:0x506D], "Stock status handler differs")
+     patch_call(candidate, BATTERY_CALL, "e5e61e", symbols["activities_battery_status"])
++    patch_call(candidate, RELOCATE_CALL, "65acfe", symbols["wake_entry"])
+     require(candidate[0x298B2:0x298B5].hex() == "25fd00", "Expected original factory constructor call")
+     displacement = symbols["factory_compact"] - BASE - FACTORY_ENTRY - 4
+     require(0 <= displacement < 0x20000, "Factory jump out of range")
+     redirect = (0x06 | (displacement << 6)).to_bytes(3, "little") + b"\xff"
+ 
+-    changed = [range(offset, offset + 3) for offset in (SET_TEXT_CALL, FRESH_CALL, REPORT_CALL, BATTERY_CALL)]
++    changed = [range(offset, offset + 3) for offset in (SET_TEXT_CALL, FRESH_CALL, REPORT_CALL, BATTERY_CALL, RELOCATE_CALL)]
+     regions = {"extension": (FACTORY_ENTRY, FACTORY_END), **SLOTS}
+     for section, (start, end) in regions.items():
+         payload = work / f"{section}.bin"
+         run([f"{prefix}-objcopy", "-O", "binary", "-j", f".{section}", "menu.elf", payload],
+             cwd=work, check=True)
+         content = (redirect if section == "extension" else b"") + payload.read_bytes()
+-        require(len(content) <= end - start, f"{section} exceeds its retired interval")
++        require(len(content) <= end - start, f"{section} needs {len(content)} bytes in a {end - start}-byte interval")
+         candidate[start:end] = content.ljust(end - start, b"\xff")
+         changed.append(range(start, end))
+         print(f"{section:14} {end - start:4} bytes, {len(content):4} used, {end - start - len(content):4} free",
+@@ -234,15 +253,18 @@
+                     for site in references(candidate, start, end)),
+                 "Stale reference to retired function interior outside approved patch sites")
+ 
+-    office_changes = [range(start, end) for start, end in regions.values()]
+-    office_changes.extend(range(offset, offset + 3) for offset in (SET_TEXT_CALL, REPORT_CALL, FRESH_CALL, BATTERY_CALL))
+-    office_changes.extend(range(slot, slot + 4) for slot, _, _, _, _ in RETIRED_PAGES.values())
+-    for name, baseline in (("Working stock operations", working), ("Office", office)):
++    header_changes = [range(start, end) for start, end in regions.values()]
++    header_changes.extend(range(offset, offset + 3) for offset in
++                          (SET_TEXT_CALL, REPORT_CALL, FRESH_CALL, BATTERY_CALL, RELOCATE_CALL))
++    header_changes.extend(range(slot, slot + 4) for slot, _, _, _, _ in RETIRED_PAGES.values())
++    for name, baseline in (("Working stock operations", working), ("Office", office), ("Header", header)):
+         require(len(baseline) == len(candidate) and
+-                all(old == new or any(i in region for region in office_changes)
++                all(old == new or any(i in region for region in header_changes)
+                     for i, (old, new) in enumerate(zip(baseline, candidate))),
+                 f"Unexpected difference outside the approved {name} diff")
+-    print("Office-image diff verified. No widened flash span or newly retired stock region.")
++    require(candidate[0x1E6E4:0x1E858] == header[0x1E6E4:0x1E858],
++            "The relocation routine and literals must retain the header bytes")
++    print("Header diff verified. Existing 112 sectors and stock relocation bounds retained.")
+     return candidate, symbols
+ 
+ 
+@@ -268,6 +290,7 @@
+         "fresh_call": candidate[FRESH_CALL:FRESH_CALL + 3],
+         "report_dispatch": candidate[0x50E8:0x50FC],
+         "battery_call": candidate[BATTERY_CALL - 3:BATTERY_CALL + 3],
++        "wake_prefix": candidate[DSP_ENTRY:RELOCATE_CALL + 3],
+         "panel_fill": candidate[0x6230:0x62B3],
+         "panel_flush_tail": candidate[0xF76A:0xF776],
+         "stock_color_default": candidate[0x3F514:0x3F5FE],
+@@ -297,7 +320,7 @@
+         ("bubble_flag", 0x5108), ("fresh_call", FRESH_CALL - 7), ("factory_entry", FACTORY_ENTRY),
+         ("factory_dispatch", 0x29890), ("factory_table_literal", 0x29888), ("factory_table", FACTORY_TABLE),
+         ("nodev_callback", 0x40FB0), ("report_dispatch", 0x50E8), ("stock_reset_idle", 0x22D94),
+-        ("battery_call", BATTERY_CALL - 6),
++        ("battery_call", BATTERY_CALL - 6), ("wake_prefix", DSP_ENTRY), ("entry_trace", ENTRY_TRACE),
+         ("panel_alloc_literals", 0x47B8), ("panel_io_literals", 0x6220), ("panel_fill", 0x6230),
+         ("panel_flush_tail", 0xF76A - 7), ("stock_color_default", 0x3F514),
+         ("page_lookup", 0x30049 - 5), ("page_table_literal", 0x30030), ("page_table", PAGE_TABLE),
+@@ -308,14 +331,14 @@
+     test_symbols = link(prefix, work, sections)
+     for name in ("native_menu_create", "handheld_report", "splash_first_press", "factory_compact",
+                  "audio_notice", "fan_notice", "climate_render_value", "unpack_splash",
+-                 "activities_battery_status"):
++                 "activities_battery_status", "wake_entry"):
+         require(test_symbols[name] - SIM == symbols[name] - BASE, f"Fixture changed address of {name}")
+     status = run(["qemu-system-xtensa", "-M", "sim", "-cpu", "de212", "-m", "16M", "-display", "none",
+                   "-monitor", "none", "-serial", "none", "-semihosting",
+                   "-device", "loader,file=menu.elf,cpu-num=0"], cwd=work, timeout=10)
+     require(not status.returncode, f"Xtensa fixture stopped with assertion code {status.returncode}")
+-    print("Xtensa fixture passed: compact Activities layout and stock battery call-through,"
+-          " exact indexed splash, stock flush, Office and TV action packets, and Climate readout")
++    print("Xtensa fixture passed: pre-clear wake probe, both Activities markers, exact splash,"
++          " stock battery call-through and flush, Office and TV packets, and Climate readout")
+ 
+ 
+ def load(path, zip_hash, dsp_hash, *, only_dsp=False):
+@@ -334,6 +357,7 @@
+     parser.add_argument("stock_v48", type=Path)
+     parser.add_argument("working_stock_ops", type=Path)
+     parser.add_argument("office_baseline", type=Path)
++    parser.add_argument("header_baseline", type=Path)
+     parser.add_argument("approved_png", type=Path)
+     parser.add_argument("--tool-prefix", default="xtensa-esp32-elf")
+     parser.add_argument("--output", type=Path, help="optional new .OFFLINE.zip after successful QEMU")
+@@ -345,10 +369,11 @@
+     reference = load(args.color_baseline, COLOR_ZIP_SHA, COLOR_DSP_SHA, only_dsp=True)
+     working = load(args.working_stock_ops, WORKING_ZIP_SHA, WORKING_DSP_SHA, only_dsp=True)
+     office = load(args.office_baseline, OFFICE_ZIP_SHA, OFFICE_DSP_SHA, only_dsp=True)
+-    with TemporaryDirectory(prefix="full-splash-proof-") as directory:
++    header = load(args.header_baseline, HEADER_ZIP_SHA, HEADER_DSP_SHA, only_dsp=True)
++    with TemporaryDirectory(prefix="visible-wake-proof-") as directory:
+         work = Path(directory)
+         prepare(args.approved_png, work)
+-        candidate, symbols = build(prefix, work, stock, reference, working, office)
++        candidate, symbols = build(prefix, work, stock, reference, working, office, header)
+         run([f"{prefix}-size", "-A", "handheld.o"], cwd=work, check=True)
+         print((work / "handheld.su").read_text(), flush=True)
+         smoke(prefix, work, candidate, symbols)
+--- a/firmware/dsp-v48-native-menu/handheld.c
++++ b/firmware/dsp-v48-native-menu/handheld.c
+@@ -263,6 +263,9 @@
+     }
+ }
+ 
++static const char wake_retained_text[] __attribute__((aligned(1), section(".retired_audio.art"))) = "Menu mode / retained";
++static const char wake_cleared_text[] __attribute__((aligned(1), section(".retired_fan.art"))) = "Menu mode / cleared";
++
+ static void draw(struct stock_label *label)
+ {
+     void *container = stock_nodev.container;
+@@ -281,8 +284,10 @@
+     bool activities = view == ACTIVITIES;
+     place(title, screen->title, 14, activities ? ACTIVITIES_TOP : TITLE_Y,
+           activities ? 174 : 212, TITLE_HEIGHT);
+-    place(mode, tv ? "TV mode" : device ? "Device mode" : "Menu mode",
+-          14, activities ? ACTIVITIES_MODE : MODE_Y, 212, 22);
++    const char *mode_text = tv ? "TV mode" : device ? "Device mode" : "Menu mode";
++    if (activities)
++        mode_text = handheld_state.wake_retained ? wake_retained_text : wake_cleared_text;
++    place(mode, mode_text, 14, activities ? ACTIVITIES_MODE : MODE_Y, 212, 22);
+     if (!activities) {
+         stock_text_align(feedback, LEFT_ALIGN, MAIN);
+         stock_text_color(feedback, SECONDARY, MAIN);
+@@ -328,6 +333,8 @@
+                   103, activities && i < 2 ? 68 : TILE_HEIGHT);
+     }
+     draw_decoration(container, view);
++    if (activities && handheld_state.startup == SPLASH_SHOWN)
++        handheld_state.wake_cookie = WAKE_COOKIE;
+ }
+ 
+ /* Called only after the upstream state decoder has validated and formatted the value. */
+@@ -674,7 +681,7 @@
+     handheld_state.view = view;
+     handheld_state.focus = focus;
+     /* The stock bus does not forward a reliable key release to the DSP. */
+-    handheld_state.transition_key = view == TV ? OK : 0;
++    handheld_state.transition_pending = view == TV;
+     draw(label);
+ }
+ 
+@@ -717,7 +724,7 @@
+     if (report->phase != 1 || report->wheel)
+         return;
+     unsigned key = control_id(report->buttons);
+-    if (!key || key == handheld_state.transition_key)
++    if (!key || (key == OK && handheld_state.transition_pending))
+         return;
+ 
+     struct stock_label *label = stock_get_child(stock_nodev.container, 1);
+@@ -726,7 +733,7 @@
+ 
+     unsigned view = handheld_state.view;
+     const struct screen *screen = &screens[view];
+-    handheld_state.transition_key = 0;
++    handheld_state.transition_pending = 0;
+     unsigned source = wire_screen[view];
+     if (source) {
+         if (key == D || (view != TV && key == BACK))
+--- a/firmware/dsp-v48-native-menu/menu.h
++++ b/firmware/dsp-v48-native-menu/menu.h
+@@ -34,15 +34,20 @@
+ extern void *stock_get_child(void *parent, int index);
+ 
+ #ifdef HANDHELD
+-/* The native menu can use one alignment word cleared at DSP startup. */
++/* The native menu and wake probe share the alignment word cleared at DSP entry. */
++enum { WAKE_COOKIE = 0x5736 };
++
+ struct handheld_ram {
+-    uint8_t view : 4;
+-    uint8_t focus : 2;
+-    uint8_t battery_icon;  /* Zero until a valid stock status report. */
+-    uint8_t transition_key;
+-    uint8_t startup;
++    uint16_t view : 4;
++    uint16_t focus : 2;
++    uint16_t wake_retained : 1;
++    uint16_t transition_pending : 1;
++    uint16_t battery_icon : 4;
++    uint16_t startup : 2;
++    volatile uint16_t wake_cookie;
+ };
+ 
+-_Static_assert(sizeof(struct handheld_ram) <= 4, "handheld state fits the alignment word");
++_Static_assert(sizeof(struct handheld_ram) == 4 && offsetof(struct handheld_ram, wake_cookie) == 2,
++               "wake state fits the alignment word");
+ extern struct handheld_ram handheld_state;
+ #endif
+--- a/firmware/dsp-v48-native-menu/smoke.S
++++ b/firmware/dsp-v48-native-menu/smoke.S
+@@ -147,6 +147,14 @@
+     retw.n
+ 
+ trampoline stock_update_battery, stock_update_battery, fixture_update_battery
++trampoline stock_relocate, stock_relocate, fixture_relocate
++trampoline entry_trace, stock_entry_trace, fixture_entry_trace
++
++.section .wake_prefix,"ax",@progbits
++.global stock_wake_prefix
++stock_wake_prefix:
++    .incbin "wake_prefix.bin"
++    retw.n
+ 
+ return_value stock_reset_idle, 0
+ trampoline stock_normalize, stock_normalize, fixture_normalize
+--- a/firmware/dsp-v48-native-menu/smoke.c
++++ b/firmware/dsp-v48-native-menu/smoke.c
+@@ -865,6 +865,65 @@
+     return 0;
+ }
+ 
++static unsigned relocate_calls, trace_calls;
++
++extern void stock_wake_prefix(void);
++
++void fixture_entry_trace(void)
++{
++    ++trace_calls;
++}
++
++void fixture_relocate(void)
++{
++    if (trace_calls != relocate_calls + 1)
++        ++errors;
++    ++relocate_calls;
++    handheld_state = (struct handheld_ram){0};
++}
++
++static int check_visible_wake(void)
++{
++    unsigned prior_sent = sent;
++    /* Model an entry with a missing or corrupted cookie. */
++    reset_splash_fixture();
++    handheld_state.wake_cookie = WAKE_COOKIE ^ 1;
++    handheld_state.wake_retained = 1;
++    handheld_state.view = 6;
++    handheld_state.focus = 3;
++    handheld_state.battery_icon = 9;
++    handheld_state.startup = 2;
++    handheld_state.transition_pending = 1;
++    stock_wake_prefix();
++    CHECK(relocate_calls == 1 && !handheld_state.wake_retained && !handheld_state.wake_cookie &&
++          !handheld_state.view && !handheld_state.focus && !handheld_state.battery_icon &&
++          !handheld_state.startup && !handheld_state.transition_pending);
++    stock_initial_label(&label, "LCD CHECK.");
++    CHECK(allocated == 5744 && proof_timer.period == 3000 && !handheld_state.wake_cookie);
++    timer_tick(2999);
++    CHECK(allocated == 5744 && !handheld_state.wake_cookie);
++    timer_tick(3000);
++    CHECK(!allocated && equal(layout_labels[1].text, "Menu mode / cleared") &&
++          handheld_state.wake_cookie == WAKE_COOKIE);
++
++    /* The same marker survives page creation and ordinary Office navigation. */
++    battery_report(82);
++    press(0x80, 138);
++    press(0x200, 139);
++    CHECK(equal(layout_labels[0].text, "Room controls") && handheld_state.wake_cookie == WAKE_COOKIE);
++    stock_wake_prefix();
++    CHECK(relocate_calls == 2 && handheld_state.wake_retained && !handheld_state.wake_cookie &&
++          !handheld_state.view && !handheld_state.focus && !handheld_state.battery_icon &&
++          !handheld_state.startup && !handheld_state.transition_pending);
++    spec.count = 2;
++    stock_initial_label(&label, "LCD CHECK.");
++    CHECK(allocated == 5744 && !handheld_state.wake_cookie);
++    stock_first_press(&group, 0x200);
++    CHECK(!allocated && equal(layout_labels[1].text, "Menu mode / retained") &&
++          handheld_state.wake_cookie == WAKE_COOKIE && sent == prior_sent && !errors);
++    return 0;
++}
++
+ static int smoke_handheld(void)
+ {
+     int checked = check_retired_pages();
+@@ -993,7 +1052,7 @@
+     battery_report(20);
+     CHECK(feedback_writes == redraws + 1);
+     CHECK(equal(title->text, "Activities") && geometry(title, 14, 14, 174, TitleHeight));
+-    CHECK(equal(mode->text, "Menu mode") && geometry(mode, 14, 50, 212, 22));
++    CHECK(equal(mode->text, "Menu mode / cleared") && geometry(mode, 14, 50, 212, 22));
+     CHECK(color_matches(title->fg, 0xf79d) && color_matches(mode->fg, 0xadb5));
+     CHECK(equal(slots[0].text, "Watch TV") && geometry(&slots[0], 14, RowOne, 103, 68));
+     CHECK(equal(slots[1].text, "Room\ncontrols") && slots[1].pad_top == 28 && geometry(&slots[1], 123, RowOne, 103, 68));
+@@ -1087,7 +1146,7 @@
+     press(0x20000, 62); /* Existing stock TV Mute */
+     CHECK(sent == 6 && match_frame(3, 15, 62));
+     press(8, 16);      /* D returns locally and restores the Watch TV tile. */
+-    CHECK(equal(title->text, "Activities") && equal(mode->text, "Menu mode"));
++    CHECK(equal(title->text, "Activities") && equal(mode->text, "Menu mode / cleared"));
+     CHECK(equal(feedback->text, "\xef\x89\x80") && feedback->align == 2 &&
+           geometry(feedback, 198, 22, 28, 18));
+     CHECK(geometry(&slots[0], 14, RowOne, 103, 68) &&
+@@ -1100,7 +1159,8 @@
+     press(0x400, 19);
+     CHECK(equal(title->text, "Activities") && color_matches(slots[2].bg, 0xd772));
+     CHECK(sent == 6 && errors == 0);
+-    return check_office_controls();
++    checked = check_office_controls();
++    return checked ? checked : check_visible_wake();
+ }
+ #else
+ static int smoke_handheld(void)
+--- /dev/null
++++ b/firmware/dsp-v48-native-menu/wake.S
+@@ -0,0 +1,18 @@
++/* Snapshot the prior menu cookie before relocation. Keep only its match flag. */
++.section .wake_entry,"ax",@progbits
++.p2align 2
++state_address: .word handheld_state
++cookie_value: .word 0x5736          /* WAKE_COOKIE, checked by the menu fixture */
++.global wake_entry
++wake_entry:
++    entry a1, 32
++    l32r a3, state_address
++    memw
++    l16ui a4, a3, 2
++    call8 stock_relocate
++    l32r a5, cookie_value
++    bne a4, a5, done
++    movi a4, 0x40                   /* wake_retained bit in cleared first byte */
++    s8i a4, a3, 0
++done:
++    retw.n

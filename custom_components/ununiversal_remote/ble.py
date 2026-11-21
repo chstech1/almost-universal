@@ -38,6 +38,12 @@ async def _write(client, payload):
     await client.write_gatt_char(CONTROL, payload, response=True)
 
 
+async def _disconnect(client):
+    with suppress(BleakError, TimeoutError, OSError):
+        async with asyncio.timeout(5):
+            await client.disconnect()
+
+
 async def activate(client, package):
     """Transfer a changed package, then verify activation on every connection."""
     _, revision, _ = await _status(client)
@@ -60,6 +66,8 @@ async def activate(client, package):
 class BleRemote:
     """Own the GATT connection and drop input from unverified activations."""
 
+    services = (SERVICE,)
+
     def __init__(self, hass, entry, address, on_event, live_text):
         self.hass = hass
         self.entry = entry
@@ -78,13 +86,21 @@ class BleRemote:
         self.bluetooth = bluetooth
         self.unsubscribe = bluetooth.async_register_callback(
             self.hass, self._advertised,
-            {"address": self.address, "service_uuid": SERVICE, "connectable": True},
+            self._matcher(),
             bluetooth.BluetoothScanningMode.ACTIVE,
         )
         self.tasks = [
             self.entry.async_create_background_task(self.hass, self._run(), "remote BLE connection"),
             self.entry.async_create_background_task(self.hass, self._dispatch_events(), "remote BLE events"),
         ]
+
+    def _matcher(self):
+        return {"address": self.address, "service_uuid": SERVICE, "connectable": True}
+
+    def _find_device(self):
+        return self.bluetooth.async_ble_device_from_address(
+            self.hass, self.address, connectable=True
+        )
 
     async def stop(self):
         """Disarm and disconnect on integration unload."""
@@ -110,7 +126,8 @@ class BleRemote:
         self.wake.set()
 
     def is_active(self, activation):
-        return activation is self.active and self.client is not None and self.client.is_connected
+        return (activation is not None and activation is self.active
+                and self.client is not None and self.client.is_connected)
 
     def _disconnected(self, client):
         if self.client is client:
@@ -132,12 +149,9 @@ class BleRemote:
                 self.events.task_done()
 
     async def _run(self):
-        bluetooth = self.bluetooth
         while True:
             self.wake.clear()
-            device = bluetooth.async_ble_device_from_address(
-                self.hass, self.address, connectable=True
-            ) if self.package is not None else None
+            device = self._find_device() if self.package is not None else None
             if device is None:
                 await self.wake.wait()
                 continue
@@ -146,23 +160,28 @@ class BleRemote:
                 client = await establish_connection(
                     BleakClientWithServiceCache, device, self.address,
                     disconnected_callback=self._disconnected, max_attempts=2,
-                    services=[SERVICE],
+                    services=self.services,
                 )
                 self.client = client
-                await client.start_notify(
-                    EVENT, lambda _, payload, source=client: self._notification(source, payload)
-                )
-                await self._serve(client)
+                await self._session(client)
             except (BleakError, TimeoutError, OSError, ValueError) as error:
                 LOGGER.debug("Handheld %s connection or sync failed: %s", self.address, error)
             finally:
                 self.active = None
                 self.client = None
                 if client is not None and client.is_connected:
-                    with suppress(BleakError, TimeoutError, OSError):
-                        async with asyncio.timeout(5):
-                            await client.disconnect()
+                    disconnect = asyncio.create_task(_disconnect(client))
+                    try:
+                        await asyncio.shield(disconnect)
+                    except asyncio.CancelledError:
+                        # A reload must not abandon an already-started teardown.
+                        await disconnect
+                        raise
             await asyncio.sleep(2)
+
+    async def _session(self, client):
+        await client.start_notify(EVENT, lambda _, payload: self._notification(client, payload))
+        await self._serve(client)
 
     async def _serve(self, client):
         previous = None

@@ -21,6 +21,10 @@ ENTITY_ACTIONS = {
     "switch": ("switch", "toggle"),
     "script": ("script", "turn_on"),
     "scene": ("scene", "turn_on"),
+    "fan": ("fan", "toggle"),
+    "open_cover": ("cover", "open_cover"),
+    "close_cover": ("cover", "close_cover"),
+    "stop_cover": ("cover", "stop_cover"),
 }
 TEMPERATURE_ACTIONS = {
     "heat_up": ("heat", 1),
@@ -29,31 +33,21 @@ TEMPERATURE_ACTIONS = {
     "cool_down": ("cool", -1),
 }
 
-# The example is ready to browse, with the user's devices assigned in the editor.
+# Soft keys A–C open activities. Soft key D returns from each activity.
 SAMPLE_MENU = {
-    "home": "activities",
+    "home": "home",
     "screens": {
-        "activities": {"title": "Activities", "buttons": {"soft_1": {"label": "TV", "next": "tv"}}},
-        "tv": {
-            "title": "TV",
+        "home": {
+            "title": "Home",
             "buttons": {
-                "soft_1": {"label": "Lights"},
-                "soft_2": {"label": "AC Control", "next": "ac"},
-                "soft_3": {"label": "Blinds", "next": "blinds"},
-                "soft_4": {"label": "Off", "next": "activities"},
+                "soft_1": {"label": "TV", "next": "tv"},
+                "soft_2": {"label": "Lights", "next": "lights"},
+                "soft_3": {"label": "Temp", "next": "temp"},
             },
         },
-        "ac": {
-            "title": "AC Control",
-            "buttons": {
-                "soft_4": {"label": "Back", "next": "tv"},
-                "channel_up": {"effect": {"kind": "heat_up"}},
-                "channel_down": {"effect": {"kind": "heat_down"}},
-                "volume_up": {"effect": {"kind": "cool_up"}},
-                "volume_down": {"effect": {"kind": "cool_down"}},
-            },
-        },
-        "blinds": {"title": "Blinds", "buttons": {"soft_4": {"label": "Back", "next": "tv"}}},
+        "tv": {"title": "TV", "buttons": {"soft_4": {"label": "Back", "next": "home"}}},
+        "lights": {"title": "Lights", "buttons": {"soft_4": {"label": "Back", "next": "home"}}},
+        "temp": {"title": "Temp", "buttons": {"soft_4": {"label": "Back", "next": "home"}}},
     },
 }
 
@@ -78,7 +72,8 @@ def _effect(effect, field):
         raise ValueError(f"{field} has an invalid action.")
     kind = _text(effect.get("kind"), f"{field} action")
     if kind in ENTITY_ACTIONS:
-        return {"kind": kind, "target": _entity(effect.get("target"), kind, field)}
+        domain, _ = ENTITY_ACTIONS[kind]
+        return {"kind": kind, "target": _entity(effect.get("target"), domain, field)}
     if kind in TEMPERATURE_ACTIONS:
         return {"kind": kind}
     if kind == "ir":

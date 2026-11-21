@@ -1,0 +1,529 @@
+--- a/firmware/dsp-v48-native-menu/build.py
++++ b/firmware/dsp-v48-native-menu/build.py
+@@ -1,4 +1,4 @@
+-"""Build the offline Activities header against the exact Office-controls DSP."""
++"""Build the offline common headers against the deployed compact Activities DSP."""
+ 
+ import argparse
+ import re
+@@ -33,6 +33,9 @@
+ 
+ OFFICE_ZIP_SHA = "b887ffddbef82a7ff78b23ee867b2424d2ce530754de32ffa82d76d3d9d3263c"
+ OFFICE_DSP_SHA = "a114b96b245cd891562b7a6fb0956d62cedeb2231722ad3a7bfc270636517293"
++
++HEADER_ZIP_SHA = "0ab181911b1982c0b8791ef1518977f652a67fade37f2f41bbd2923d38a4fbe2"
++HEADER_DSP_SHA = "8844d43533a77ed06f219ce1c927d9492fda9b3181917300197e248e6e99fcd6"
+ 
+ SLOTS = {
+     "retired_audio": (0x271A4, 0x27405),
+@@ -184,7 +187,7 @@
+     candidate[offset:offset + 3] = instruction.to_bytes(3, "little")
+ 
+ 
+-def build(prefix, work, stock, reference, working, office):
++def build(prefix, work, stock, reference, working, office, header):
+     verify_retirements(stock, reference)
+     compile_c(prefix, work, "handheld")
+     symbols = link(prefix, work)
+@@ -200,7 +203,7 @@
+     patch_call(candidate, FRESH_CALL, "250425", symbols["splash_first_press"])
+     require(candidate[0x5054:0x506D] == stock[0x5054:0x506D] ==
+             office[0x5054:0x506D], "Stock status handler differs")
+-    patch_call(candidate, BATTERY_CALL, "e5e61e", symbols["activities_battery_status"])
++    patch_call(candidate, BATTERY_CALL, "e5e61e", symbols["handheld_battery_status"])
+     require(candidate[0x298B2:0x298B5].hex() == "25fd00", "Expected original factory constructor call")
+     displacement = symbols["factory_compact"] - BASE - FACTORY_ENTRY - 4
+     require(0 <= displacement < 0x20000, "Factory jump out of range")
+@@ -237,12 +240,12 @@
+     office_changes = [range(start, end) for start, end in regions.values()]
+     office_changes.extend(range(offset, offset + 3) for offset in (SET_TEXT_CALL, REPORT_CALL, FRESH_CALL, BATTERY_CALL))
+     office_changes.extend(range(slot, slot + 4) for slot, _, _, _, _ in RETIRED_PAGES.values())
+-    for name, baseline in (("Working stock operations", working), ("Office", office)):
++    for name, baseline in (("Working stock operations", working), ("Office", office), ("Activities header", header)):
+         require(len(baseline) == len(candidate) and
+                 all(old == new or any(i in region for region in office_changes)
+                     for i, (old, new) in enumerate(zip(baseline, candidate))),
+                 f"Unexpected difference outside the approved {name} diff")
+-    print("Office-image diff verified. No widened flash span or newly retired stock region.")
++    print("Deployed-header diff verified. No widened flash span or newly retired stock region.")
+     return candidate, symbols
+ 
+ 
+@@ -308,13 +311,13 @@
+     test_symbols = link(prefix, work, sections)
+     for name in ("native_menu_create", "handheld_report", "splash_first_press", "factory_compact",
+                  "audio_notice", "fan_notice", "climate_render_value", "unpack_splash",
+-                 "activities_battery_status"):
++                 "handheld_battery_status"):
+         require(test_symbols[name] - SIM == symbols[name] - BASE, f"Fixture changed address of {name}")
+     status = run(["qemu-system-xtensa", "-M", "sim", "-cpu", "de212", "-m", "16M", "-display", "none",
+                   "-monitor", "none", "-serial", "none", "-semihosting",
+                   "-device", "loader,file=menu.elf,cpu-num=0"], cwd=work, timeout=10)
+     require(not status.returncode, f"Xtensa fixture stopped with assertion code {status.returncode}")
+-    print("Xtensa fixture passed: compact Activities layout and stock battery call-through,"
++    print("Xtensa fixture passed: shared header, all-screen stock battery and uncluttered TV,"
+           " exact indexed splash, stock flush, Office and TV action packets, and Climate readout")
+ 
+ 
+@@ -334,6 +337,7 @@
+     parser.add_argument("stock_v48", type=Path)
+     parser.add_argument("working_stock_ops", type=Path)
+     parser.add_argument("office_baseline", type=Path)
++    parser.add_argument("header_baseline", type=Path)
+     parser.add_argument("approved_png", type=Path)
+     parser.add_argument("--tool-prefix", default="xtensa-esp32-elf")
+     parser.add_argument("--output", type=Path, help="optional new .OFFLINE.zip after successful QEMU")
+@@ -345,10 +349,11 @@
+     reference = load(args.color_baseline, COLOR_ZIP_SHA, COLOR_DSP_SHA, only_dsp=True)
+     working = load(args.working_stock_ops, WORKING_ZIP_SHA, WORKING_DSP_SHA, only_dsp=True)
+     office = load(args.office_baseline, OFFICE_ZIP_SHA, OFFICE_DSP_SHA, only_dsp=True)
+-    with TemporaryDirectory(prefix="full-splash-proof-") as directory:
++    header = load(args.header_baseline, HEADER_ZIP_SHA, HEADER_DSP_SHA, only_dsp=True)
++    with TemporaryDirectory(prefix="shared-header-proof-") as directory:
+         work = Path(directory)
+         prepare(args.approved_png, work)
+-        candidate, symbols = build(prefix, work, stock, reference, working, office)
++        candidate, symbols = build(prefix, work, stock, reference, working, office, header)
+         run([f"{prefix}-size", "-A", "handheld.o"], cwd=work, check=True)
+         print((work / "handheld.su").read_text(), flush=True)
+         smoke(prefix, work, candidate, symbols)
+--- a/firmware/dsp-v48-native-menu/handheld.c
++++ b/firmware/dsp-v48-native-menu/handheld.c
+@@ -84,7 +84,7 @@
+     FOCUS_TEXT = NATIVE_RGB565(0x1922), PRIMARY = NATIVE_RGB565(0xf79d),
+     SECONDARY = NATIVE_RGB565(0xadb5),
+     TITLE_CHILD = 2, MODE_CHILD, FEEDBACK_CHILD, FIRST_SLOT_CHILD,
+-    NOTE_CHILD = FIRST_SLOT_CHILD + 4, BODY_CHILD, FIRST_MARK_CHILD, SPLASH_CHILD = NOTE_CHILD,
++    BATTERY_CHILD = FIRST_SLOT_CHILD + 4, FIRST_MARK_CHILD, SPLASH_CHILD = BATTERY_CHILD,
+     SPLASH_VISIBLE = 1, SPLASH_SHOWN = 2, IMAGE_DELETE = 0x21,
+     SPLASH_NAVY = NATIVE_RGB565(0x08a5),
+     BATTERY_LOW = NATIVE_RGB565(0xfe93),
+@@ -92,10 +92,9 @@
+ 
+ #ifdef HANDHELD_POLISH
+ enum {
+-    TILE = NATIVE_RGB565(0x1903), TITLE_Y = 45, TITLE_HEIGHT = 32, MODE_Y = 79,
+-    GRID_Y = 104, TILE_HEIGHT = 61, ROW_PITCH = 67, TILE_PAD_TOP = 22, TILE_RADIUS = 5,
++    TILE = NATIVE_RGB565(0x1903), TITLE_Y = 14, TITLE_HEIGHT = 32, MODE_Y = 50,
++    GRID_Y = 78, TILE_HEIGHT = 61, ROW_PITCH = 67, TILE_RADIUS = 5,
+     CAPTION_INSET = 1, CAPTION_WIDTH = 58,
+-    ACTIVITIES_TOP = 14, ACTIVITIES_MODE = 50, ACTIVITIES_GRID = 78,
+ };
+ extern const uint8_t stock_compact_font[];
+ #else
+@@ -196,9 +195,10 @@
+ __attribute__((noinline, section(".retired_audio")))
+ static void draw_battery(struct stock_label *label)
+ {
++    if (label->class_pointer != stock_label_class)
++        return;
+     unsigned icon = handheld_state.battery_icon;
+     if (icon) {
+-        stock_text_align(label, CENTER_ALIGN, MAIN);
+         stock_text_color(label, icon & 8 ? BATTERY_LOW : SECONDARY, MAIN);
+         place(label, battery_glyphs[(icon & 7) - 1], 198, 22, 28, 18);
+     } else {
+@@ -209,7 +209,7 @@
+ extern void stock_update_battery(uint8_t percent);
+ 
+ __attribute__((section(".retired_audio")))
+-void activities_battery_status(uint8_t percent)
++void handheld_battery_status(uint8_t percent)
+ {
+     stock_update_battery(percent);
+     unsigned icon = 0;
+@@ -221,8 +221,8 @@
+     if (icon == handheld_state.battery_icon)
+         return;
+     handheld_state.battery_icon = icon;
+-    if (handheld_state.startup == SPLASH_SHOWN && handheld_state.view == ACTIVITIES && nodev_active()) {
+-        struct stock_label *label = stock_get_child(stock_nodev.container, FEEDBACK_CHILD);
++    if (handheld_state.startup == SPLASH_SHOWN && nodev_active()) {
++        struct stock_label *label = stock_get_child(stock_nodev.container, BATTERY_CHILD);
+         if (label)
+             draw_battery(label);
+     }
+@@ -231,16 +231,9 @@
+ __attribute__((noinline, section(".retired_fan")))
+ static void draw_decoration(void *container, unsigned view)
+ {
+-    struct stock_label *note = stock_get_child(container, NOTE_CHILD);
+-    struct stock_label *body = stock_get_child(container, BODY_CHILD);
+-    if (note && view == TV)
+-        place(note, "TV controls", 14, 106, 212, 73);
+-    else if (note)
+-        stock_add_flag(note, HIDDEN);
+-    if (body && view == TV)
+-        place(body, "Direction pad,\nchannel & volume", 26, 141, 152, 36);
+-    else if (body)
+-        stock_add_flag(body, HIDDEN);
++    struct stock_label *battery = stock_get_child(container, BATTERY_CHILD);
++    if (battery)
++        draw_battery(battery);
+ 
+     for (unsigned i = 0; i < 3; ++i) {
+         void *image = stock_get_child(container, FIRST_MARK_CHILD + i);
+@@ -250,11 +243,11 @@
+             unsigned shape = view == COVERS ? 5 : 3 * view + i;
+             unsigned mark = 2 * shape + (i == handheld_state.focus);
+             stock_image_set_source(image, &marks[mark]);
+-            int y = view == ACTIVITIES ? (i < 2 ? 86 : 160) : (i < 2 ? 112 : 179);
++            int y = GRID_Y + 8 + (i < 2 ? 0 : view == ACTIVITIES ? 74 : ROW_PITCH);
+             stock_set_position(image, 23 + (i % 2) * 109, y);
+         } else if (view == TV && i == 0) {
+             stock_image_set_source(image, &marks[TV_MARK]);
+-            stock_set_position(image, 189, 130);
++            stock_set_position(image, 108, 139);
+         } else {
+             stock_add_flag(image, HIDDEN);
+             continue;
+@@ -279,23 +272,15 @@
+     bool tv = view == TV;
+     bool device = wire_screen[view] != 0;
+     bool activities = view == ACTIVITIES;
+-    place(title, screen->title, 14, activities ? ACTIVITIES_TOP : TITLE_Y,
+-          activities ? 174 : 212, TITLE_HEIGHT);
+-    place(mode, tv ? "TV mode" : device ? "Device mode" : "Menu mode",
+-          14, activities ? ACTIVITIES_MODE : MODE_Y, 212, 22);
+-    if (!activities) {
+-        stock_text_align(feedback, LEFT_ALIGN, MAIN);
+-        stock_text_color(feedback, SECONDARY, MAIN);
+-    }
++    bool long_title = view == ROOM;
++    stock_text_font(title, long_title ? stock_compact_font : stock_menu_font, MAIN);
++    place(title, screen->title, 14, long_title ? 22 : TITLE_Y, 174, long_title ? 16 : TITLE_HEIGHT);
++    place(mode, tv ? "TV mode" : device ? "Device mode" : "Menu mode", 14, MODE_Y, 212, 22);
+     bool climate = view == CLIMATE;
+-    if (tv)
+-        place(feedback, "Hard Back and Home\nstay in TV mode", 14, 189, 212, 36);
+-    else if (climate)
++    if (climate)
+         place(feedback, "No reading yet", 14, 159, 212, 21);
+     else if (view == SCENES)
+         place(feedback, "Set up in Home Assistant", 14, 253, 212, 21);
+-    else if (activities)
+-        draw_battery(feedback);
+     else
+         stock_add_flag(feedback, HIDDEN);
+ 
+@@ -312,19 +297,19 @@
+         bool focused = !climate && !device && i == handheld_state.focus;
+         bool artwork = view <= SCENES || view == COVERS;
+         stock_text_align(slot, climate || artwork ? LEFT_ALIGN : CENTER_ALIGN, MAIN);
++        stock_text_font(slot, climate && i == 1 ? stock_menu_font : stock_compact_font, MAIN);
+         stock_bg_color(slot, climate ? PANEL : focused ? FOCUS : TILE, MAIN);
+         stock_text_color(slot, climate && !i ? SECONDARY : focused ? FOCUS_TEXT : PRIMARY, MAIN);
+         stock_pad_left(slot, artwork ? 9 : 0, MAIN);
+         stock_pad_top(slot, climate ? 0 : device ? 7 : i == 3 ? 11 : 28, MAIN);
+         stock_radius(slot, device || climate ? 0 : TILE_RADIUS, MAIN);
+         if (climate)
+-            place(slot, i ? "--" : "Current temperature", 14, i ? 132 : 105, 212, 20);
++            place(slot, i ? "--" : "Current temperature", 14, i ? 98 : 78, 212, i ? 32 : 18);
+         else if (device)
+             place(slot, captions[i], 60 * i + CAPTION_INSET, 274, CAPTION_WIDTH, 46);
+         else
+             place(slot, tiles[screen->first_tile + i], 14 + (i % 2) * 109,
+-                  activities ? ACTIVITIES_GRID + (i < 2 ? 0 : 74) :
+-                               GRID_Y + (i < 2 ? 0 : ROW_PITCH),
++                  GRID_Y + (i < 2 ? 0 : activities ? 74 : ROW_PITCH),
+                   103, activities && i < 2 ? 68 : TILE_HEIGHT);
+     }
+     draw_decoration(container, view);
+@@ -402,25 +387,12 @@
+ 
+ static void add_decoration(void *container)
+ {
+-    struct stock_label *note = stock_label_create(container);
+-    if (!note)
+-        return;
+-    stock_text_font(note, stock_compact_font, MAIN);
+-    stock_text_color(note, PRIMARY, MAIN);
+-    stock_bg_color(note, NATIVE_RGB565(0x2144), MAIN);
+-    stock_bg_opacity(note, 255, MAIN);
+-    stock_text_align(note, LEFT_ALIGN, MAIN);
+-    stock_pad_top(note, 12, MAIN);
+-    stock_pad_left(note, 12, MAIN);
+-    stock_radius(note, 4, MAIN);
+-    stock_add_flag(note, HIDDEN);
+-    struct stock_label *body = stock_label_create(container);
+-    if (!body)
+-        return;
+-    stock_text_font(body, stock_compact_font, MAIN);
+-    stock_text_color(body, SECONDARY, MAIN);
+-    stock_text_align(body, LEFT_ALIGN, MAIN);
+-    stock_add_flag(body, HIDDEN);
++    struct stock_label *battery = stock_label_create(container);
++    if (!battery)
++        return;
++    stock_text_font(battery, stock_compact_font, MAIN);
++    stock_text_align(battery, CENTER_ALIGN, MAIN);
++    stock_add_flag(battery, HIDDEN);
+     for (unsigned i = 0; i < 3; ++i) {
+         void *image = stock_image_create(container);
+         if (!image)
+--- a/firmware/dsp-v48-native-menu/proof_marks.inc
++++ b/firmware/dsp-v48-native-menu/proof_marks.inc
+@@ -41,7 +41,7 @@
+     0x05, 0x01, 0x01, 0x40, 0x00, 0x40, 0x04, 0x00, 0x00, 0x14, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00,
+ };
+ static const uint8_t mark_6[] = {
+-    0x20, 0x28, 0x20, 0xff, 0x94, 0xee, 0xd5, 0xff, 0x94, 0xee, 0xd5, 0xff, 0x94, 0xee, 0xd5, 0xff,
++    0x10, 0x14, 0x10, 0xff, 0xac, 0xb6, 0xac, 0xff, 0xac, 0xb6, 0xac, 0xff, 0xac, 0xb6, 0xac, 0xff,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+     0x00, 0x00, 0x05, 0x55, 0x55, 0x55, 0x55, 0x54, 0x05, 0x55, 0x55, 0x55, 0x55, 0x54, 0x05, 0x55,
+     0x55, 0x55, 0x55, 0x54, 0x05, 0x40, 0x00, 0x00, 0x00, 0x54, 0x05, 0x40, 0x00, 0x00, 0x00, 0x54,
+--- a/firmware/dsp-v48-native-menu/smoke.c
++++ b/firmware/dsp-v48-native-menu/smoke.c
+@@ -66,10 +66,11 @@
+     int x, y, w, h;
+     unsigned hidden, bg, opacity, fg, align, pad_top, pad_left, radius;
+     const struct image_desc *image;
++    const void *font;
+     void (*on_delete)(const struct stock_event *);
+     const void *delete_data;
+ } layout_labels[14];
+-static unsigned feedback_writes;
++static unsigned feedback_writes, battery_writes;
+ const uint8_t stock_image_class[] = {3};
+ extern const uint8_t original_splash_pixels[];
+ extern int stock_indexed_palette(const struct image_desc *, uint16_t *, uint8_t *);
+@@ -149,6 +150,8 @@
+                 ++changes;
+             if (i == 2)
+                 ++feedback_writes;
++            if (i == 7)
++                ++battery_writes;
+             return;
+         }
+     }
+@@ -393,13 +396,13 @@
+ {
+     struct layout_label *child = layout_child(object, selector);
+ #ifdef HANDHELD_POLISH
+-    const void *expected = child == &layout_labels[0] && spec.count != 1 ? stock_menu_font : stock_compact_font;
++    if (font != stock_menu_font && font != stock_compact_font)
++        ++errors;
+ #else
+-    (void)child;
+-    const void *expected = stock_menu_font;
+-#endif
+-    if (font != expected)
+-        ++errors;
++    if (font != stock_menu_font)
++        ++errors;
++#endif
++    child->font = font;
+ }
+ 
+ #define SET_STYLE(suffix, member) \
+@@ -556,8 +559,8 @@
+ #ifdef HANDHELD_LAYOUT
+ #ifdef HANDHELD_POLISH
+ enum {
+-    MenuTitle = 0, PanelNote = 7, PanelBody = 8, FirstMark = 9, FirstCrop = 7,
+-    MenuChildCount = 14, SplashChildCount = 12, FirstCropChild = 9,
++    MenuTitle = 0, BatteryLabel = 7, FirstMark = 8, FirstCrop = 7,
++    MenuChildCount = 13, SplashChildCount = 12, FirstCropChild = 9,
+     TitleHeight = 32,
+     RowOne = 78, RowTwo = 152, TileHeight = 61, TilePad = 28, TileRadius = 5,
+     IdleFill = 0x1903, FooterX = 1, FooterWidth = 58,
+@@ -865,6 +868,41 @@
+     return 0;
+ }
+ 
++static int check_common_headers(void)
++{
++    static const char *const titles[] = {
++        "Activities", "Room controls", "Scenes", "Lights", "Climate", "Blinds",
++        "Watch TV", "Covers", "Curtains", "Fan",
++    };
++    static const char *const modes[] = {
++        "Menu mode", "Menu mode", "Menu mode", "Device mode", "Menu mode", "Device mode",
++        "TV mode", "Menu mode", "Device mode", "Device mode",
++    };
++    struct layout_label *title = &layout_labels[0], *mode = &layout_labels[1];
++    struct layout_label *battery = &layout_labels[BatteryLabel];
++    unsigned events = sent;
++    for (unsigned view = 0; view < sizeof titles / sizeof titles[0]; ++view) {
++        handheld_state.view = view;
++        handheld_state.focus = 0;
++        spec.count = 2;
++        stock_initial_label(&label, "LCD CHECK.");
++        bool compact = view == 1;  /* Room controls uses verified compact-font advance. */
++        CHECK(equal(title->text, titles[view]) && geometry(title, 14, compact ? 22 : 14, 174, compact ? 16 : 32));
++        CHECK(title->font == (compact ? stock_compact_font : stock_menu_font));
++        CHECK(equal(mode->text, modes[view]) && geometry(mode, 14, 50, 212, 22));
++        unsigned title_count = changes, feedback_count = feedback_writes;
++        battery_report(0);
++        CHECK(geometry(battery, 198, 22, 28, 18) && equal(battery->text, "\xef\x89\x84") &&
++              color_matches(battery->fg, 0xfe93));
++        battery_report(82);
++        CHECK(equal(battery->text, "\xef\x89\x81") && color_matches(battery->fg, 0xadb5));
++        battery_report(255);
++        CHECK(battery->hidden && feedback_writes == feedback_count && changes == title_count);
++    }
++    CHECK(sent == events && !errors);
++    return 0;
++}
++
+ static int smoke_handheld(void)
+ {
+     int checked = check_retired_pages();
+@@ -895,7 +933,7 @@
+     CHECK(spec.count == MenuChildCount && !allocated && equal(layout_labels[0].text, "Activities"));
+     raw_report(10, 1, 2, 0, 0xf4);
+     raw_report(10, 0, 0, 0, 0xf5);
+-    struct layout_label *startup_battery = &layout_labels[2];
++    struct layout_label *startup_battery = &layout_labels[BatteryLabel];
+     CHECK(startup_battery->hidden);
+     battery_report(82);
+     CHECK(!startup_battery->hidden && equal(startup_battery->text, "\xef\x89\x81"));
+@@ -910,8 +948,9 @@
+     reset_splash_fixture();
+     stock_initial_label(&label, "LCD CHECK.");
+     CHECK(allocated == 5744 && proof_timer.callback);
++    unsigned writes_during_splash = battery_writes;
+     battery_report(0);
+-    CHECK(startup_battery->hidden && battery_argument == 0);
++    CHECK(battery_writes == writes_during_splash && battery_argument == 0);
+     timer_tick(3000);
+     CHECK(!startup_battery->hidden && equal(startup_battery->text, "\xef\x89\x84"));
+     CHECK(color_matches(startup_battery->fg, 0xfe93));
+@@ -953,6 +992,7 @@
+     struct layout_label *title = &layout_labels[0];
+     struct layout_label *mode = &layout_labels[1];
+     struct layout_label *feedback = &layout_labels[2];
++    struct layout_label *battery = &layout_labels[BatteryLabel];
+     struct layout_label *slots = &layout_labels[3];
+ #ifdef HANDHELD_COLOR
+     uint16_t stock_white = stock_color_default(0x20);
+@@ -962,7 +1002,7 @@
+     CHECK(!color_matches(0x10a2, 0x10a2)); /* Reproduce the mismatched bench palette. */
+ #endif
+     CHECK(spec.count == MenuChildCount && color_matches(panel_bg, 0x10a2) && panel_opacity == 255);
+-    CHECK(icon_hidden && initial_label_hidden && feedback->hidden);
++    CHECK(icon_hidden && initial_label_hidden && feedback->hidden && battery->hidden);
+     static const struct {
+         uint8_t percent, glyph;
+         uint16_t color;
+@@ -977,21 +1017,21 @@
+         char glyph[] = {0xef, 0x89, (char)gauge[i].glyph, 0};
+         battery_report(gauge[i].percent);
+         CHECK(battery_updates == updates + i + 1 && battery_argument == gauge[i].percent);
+-        CHECK(!feedback->hidden && equal(feedback->text, glyph) && feedback->align == 2 &&
+-              geometry(feedback, 198, 22, 28, 18) && color_matches(feedback->fg, gauge[i].color));
++        CHECK(!battery->hidden && equal(battery->text, glyph) && battery->align == 2 &&
++              geometry(battery, 198, 22, 28, 18) && color_matches(battery->fg, gauge[i].color));
+     }
+     battery_report(101);
+-    CHECK(feedback->hidden && battery_argument == 101);
++    CHECK(battery->hidden && battery_argument == 101);
+     battery_report(20);
+-    unsigned redraws = feedback_writes;
++    unsigned redraws = battery_writes;
+     battery_report(18); /* Same glyph and amber color. */
+-    CHECK(feedback_writes == redraws && battery_argument == 18);
++    CHECK(battery_writes == redraws && battery_argument == 18);
+     active_page = "charge";
+     battery_report(82);
+-    CHECK(feedback_writes == redraws && battery_argument == 82);
++    CHECK(battery_writes == redraws && battery_argument == 82);
+     active_page = stock_nodev_name;
+     battery_report(20);
+-    CHECK(feedback_writes == redraws + 1);
++    CHECK(battery_writes == redraws + 1);
+     CHECK(equal(title->text, "Activities") && geometry(title, 14, 14, 174, TitleHeight));
+     CHECK(equal(mode->text, "Menu mode") && geometry(mode, 14, 50, 212, 22));
+     CHECK(color_matches(title->fg, 0xf79d) && color_matches(mode->fg, 0xadb5));
+@@ -1013,18 +1053,19 @@
+     const struct image_desc *activity_mark = layout_labels[FirstMark].image;
+     press(0x200, 3);   /* Open Room controls, focus Climate, then open it. */
+     CHECK(!layout_labels[FirstMark].hidden && layout_labels[FirstMark].image != activity_mark &&
+-          layout_labels[FirstMark+2].y == 179);
++          layout_labels[FirstMark+2].y == 153);
+     press(0x80, 4);
+     press(0x200, 5);
+     CHECK(equal(title->text, "Climate") && equal(slots[0].text, "Current temperature"));
+     CHECK(layout_labels[FirstMark].hidden && layout_labels[FirstMark+1].hidden);
+-    CHECK(geometry(&slots[0], 14, 105, 212, 20));
+-    CHECK(geometry(&slots[1], 14, 132, 212, 20) && equal(slots[1].text, "--"));
++    CHECK(geometry(&slots[0], 14, 78, 212, 18));
++    CHECK(geometry(&slots[1], 14, 98, 212, 32) && equal(slots[1].text, "--"));
+     CHECK(geometry(feedback, 14, 159, 212, 21) && equal(feedback->text, "No reading yet"));
+     CHECK(feedback->align == 1 && color_matches(feedback->fg, 0xadb5));
+     battery_report(82);
+     CHECK(equal(feedback->text, "No reading yet") && geometry(feedback, 14, 159, 212, 21));
+     CHECK(color_matches(slots[0].bg, 0x10a2) && slots[0].align == 1 && slots[2].hidden && slots[3].hidden);
++    CHECK(slots[0].font == stock_compact_font && slots[1].font == stock_menu_font);
+     climate_render_value("68.0\xc2\xb0" "F", false);
+     CHECK(equal(slots[1].text, "68.0\xc2\xb0" "F") && !*feedback->text);
+     climate_render_value("-9.0\xc2\xb0" "C", true);
+@@ -1039,13 +1080,13 @@
+     press(0x400, 6);
+     CHECK(equal(title->text, "Room controls") && color_matches(slots[1].bg, 0xd772));
+     CHECK(equal(slots[2].text, "Covers") && equal(slots[3].text, "\xef\x80\x93\nFan") &&
+-          geometry(&slots[3], 123, 171, 103, 61));
++          geometry(&slots[3], 123, 145, 103, 61));
+     climate_render_value("68.0\xc2\xb0" "F", false);
+-    CHECK(equal(slots[1].text, "Climate"));
++    CHECK(equal(slots[1].text, "Climate") && slots[1].font == stock_compact_font);
+     press(0x400, 7);
+     CHECK(equal(title->text, "Activities") && color_matches(slots[1].bg, 0xd772));
+-    CHECK(equal(feedback->text, "\xef\x89\x81") && feedback->align == 2 &&
+-          geometry(feedback, 198, 22, 28, 18));
++    CHECK(equal(battery->text, "\xef\x89\x81") && battery->align == 2 &&
++          geometry(battery, 198, 22, 28, 18));
+ 
+     press(0x100, 8);
+     press(0x200, 9);   /* Open TV mode. */
+@@ -1053,19 +1094,17 @@
+     raw_report(10, 0x200, 2, 0, 11);
+     raw_report(10, 0, 0, 0, 12);
+     CHECK(equal(title->text, "Watch TV") && equal(mode->text, "TV mode") && sent == 0);
+-    CHECK(equal(feedback->text, "Hard Back and Home\nstay in TV mode") &&
+-          geometry(feedback, 14, 189, 212, 36));
+-    CHECK(feedback->align == 1 && color_matches(feedback->fg, 0xadb5));
++    CHECK(feedback->hidden && !layout_labels[FirstMark].hidden &&
++          layout_labels[FirstMark+1].hidden && layout_labels[FirstMark+2].hidden);
++    const struct layout_label *tv_mark = &layout_labels[FirstMark];
++    CHECK(tv_mark->x == 108 && tv_mark->y == 139 && tv_mark->image->data_size == 160);
++    uint16_t tv_palette[4];
++    uint8_t tv_alpha[4];
++    CHECK(stock_indexed_palette(tv_mark->image, tv_palette, tv_alpha) &&
++          color_matches(tv_palette[0], 0x10a2) && color_matches(tv_palette[1], 0xadb5));
+     battery_report(100);
+-    CHECK(equal(feedback->text, "Hard Back and Home\nstay in TV mode"));
+-    CHECK(geometry(&layout_labels[PanelNote], 14, 106, 212, 73) &&
+-          equal(layout_labels[PanelNote].text, "TV controls"));
+-    CHECK(geometry(&layout_labels[PanelBody], 26, 141, 152, 36) &&
+-          equal(layout_labels[PanelBody].text, "Direction pad,\nchannel & volume") &&
+-          color_matches(layout_labels[PanelBody].fg, 0xadb5));
+-    CHECK(layout_labels[FirstMark].image->data_size == 160 && layout_labels[FirstMark].x == 189 &&
+-          !layout_labels[FirstMark].hidden && layout_labels[FirstMark+1].hidden &&
+-          layout_labels[FirstMark+2].hidden);
++    CHECK(feedback->hidden && equal(battery->text, "\xef\x89\x80") &&
++          geometry(battery, 198, 22, 28, 18));
+     static const char *const captions[] = {"A\nInput", "B\nGuide", "C\nMenu", "D\nBack"};
+     for (unsigned i = 0; i < 4; ++i) {
+         CHECK(geometry(&slots[i], i * 60 + FooterX, 274, FooterWidth, 46) &&
+@@ -1088,8 +1127,8 @@
+     CHECK(sent == 6 && match_frame(3, 15, 62));
+     press(8, 16);      /* D returns locally and restores the Watch TV tile. */
+     CHECK(equal(title->text, "Activities") && equal(mode->text, "Menu mode"));
+-    CHECK(equal(feedback->text, "\xef\x89\x80") && feedback->align == 2 &&
+-          geometry(feedback, 198, 22, 28, 18));
++    CHECK(equal(battery->text, "\xef\x89\x80") && battery->align == 2 &&
++          geometry(battery, 198, 22, 28, 18));
+     CHECK(geometry(&slots[0], 14, RowOne, 103, 68) &&
+           color_matches(slots[0].bg, 0xd772) && slots[3].hidden);
+     press(0x2000, 17); /* Move to Scenes and verify both nested mark objects. */
+@@ -1100,7 +1139,8 @@
+     press(0x400, 19);
+     CHECK(equal(title->text, "Activities") && color_matches(slots[2].bg, 0xd772));
+     CHECK(sent == 6 && errors == 0);
+-    return check_office_controls();
++    checked = check_office_controls();
++    return checked ? checked : check_common_headers();
+ }
+ #else
+ static int smoke_handheld(void)
