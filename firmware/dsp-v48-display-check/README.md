@@ -38,7 +38,7 @@ Use SwitchBot **DSP_TX** to the ESP8266 board pin marked **TX** and common groun
 From the Switchbot workspace root, use the existing environment with pySerial 3.5. Run each command in its own capture pass, with a fresh output file. Wait for `Receive-only capture ready` before Reset. [Capture source](capture.py)
 
 ```sh
-display_src=ununiversal-remote/firmware/dsp-v48-display-check
+display_src=almost-universal/firmware/dsp-v48-display-check
 display_logs=$(mktemp -d /tmp/switchbot-display-capture.XXXXXX)
 esp8266_port=/dev/cu.usbserial-4
 
@@ -53,7 +53,7 @@ tools/esphome-venv/bin/python -B "$display_src/capture.py" "$esp8266_port" \
 
 ```sh
 display_build=$(mktemp -d)
-python3 -B ununiversal-remote/firmware/dsp-v48-display-check/build.py \
+python3 -B almost-universal/firmware/dsp-v48-display-check/build.py \
   artifacts/universal-remote/WoRWS_freq_app_V48.zip "$display_build/display-check.zip" \
   --tool-prefix "$HOME/Library/Arduino15/packages/esp32/tools/esp-x32/2507/bin/xtensa-esp32-elf" --smoke
 cmp "$display_build/display-check.zip" artifacts/universal-remote/WoRWS-v4.8-DSP-DISPLAY-CHECK.CANDIDATE.zip
@@ -86,7 +86,7 @@ From the Switchbot workspace root, build and test offline with the same Xtensa t
 
 ```sh
 phase_build=$(mktemp -d)
-python3 -B ununiversal-remote/firmware/dsp-v48-display-check/build_phase_trace.py \
+python3 -B almost-universal/firmware/dsp-v48-display-check/build_phase_trace.py \
   artifacts/universal-remote/WoRWS-v4.8-DSP-ALMOST-UNIVERSAL-STOCK-OPS-CONTROL.OFFLINE.zip \
   "$phase_build/trace.OFFLINE.zip" \
   --tool-prefix "$HOME/Library/Arduino15/packages/esp32/tools/esp-x32/2507/bin/xtensa-esp32-elf"

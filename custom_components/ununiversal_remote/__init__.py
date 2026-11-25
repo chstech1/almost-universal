@@ -16,7 +16,7 @@ from .stock import STOCK_MODES
 
 PANEL = "remote-menus"
 MODULE_URL = "/ununiversal_remote/panel.js"
-EDITOR_VERSION = "0.1.6"
+EDITOR_VERSION = "0.1.6-au"
 
 
 async def async_setup(hass, config):
@@ -39,7 +39,7 @@ async def async_setup_entry(hass, entry):
     await panel_custom.async_register_panel(
         hass,
         frontend_url_path=PANEL,
-        webcomponent_name="ununiversal-remote-panel",
+        webcomponent_name="almost-universal-panel",
         sidebar_title="Remote Menus",
         sidebar_icon="mdi:remote-tv",
         module_url=f"{MODULE_URL}?v={EDITOR_VERSION}",
@@ -62,7 +62,7 @@ async def async_unload_entry(hass, entry):
 def _remote(hass, connection, message):
     remote = hass.data.get(DOMAIN)
     if remote is None:
-        connection.send_error(message["id"], "not_loaded", "Set up The Ununiversal Remote first.")
+        connection.send_error(message["id"], "not_loaded", "Set up Almost Universal first.")
     return remote
 
 

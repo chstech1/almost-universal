@@ -34,7 +34,7 @@ From the Switchbot workspace root, build and compare offline.
 
 ```sh
 splash_build=$(mktemp -d)
-python3 -B ununiversal-remote/firmware/dsp-v48-native-menu/build.py \
+python3 -B almost-universal/firmware/dsp-v48-native-menu/build.py \
   artifacts/universal-remote/WoRWS-v4.8-DSP-DISPLAY-CHECK.CANDIDATE.zip \
   "$splash_build/splash.zip" --splash --smoke \
   --tool-prefix "$HOME/Library/Arduino15/packages/esp32/tools/esp-x32/2507/bin/xtensa-esp32-elf"

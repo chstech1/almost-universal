@@ -20,7 +20,7 @@
   "config": {
     "step": {
       "user": {
-        "title": "Set up The Ununiversal Remote",
+        "title": "Set up Almost Universal",
         "description": "Optionally choose a switch for soft key A. Open Remote Menus after setup to edit the menu.",
         "data": {"remote_id": "Remote ID", "switch_entity": "First switch (optional)"}
       }

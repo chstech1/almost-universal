@@ -43,7 +43,7 @@ To reproduce from the Switchbot workspace root:
 
 ```sh
 action_build=$(mktemp -d)
-python3 -B ununiversal-remote/firmware/dsp-v48-native-menu/build.py \
+python3 -B almost-universal/firmware/dsp-v48-native-menu/build.py \
   artifacts/universal-remote/WoRWS-v4.8-DSP-DISPLAY-CHECK.CANDIDATE.zip \
   "$action_build/controls-a.zip" --action --smoke \
   --tool-prefix "$HOME/Library/Arduino15/packages/esp32/tools/esp-x32/2507/bin/xtensa-esp32-elf"

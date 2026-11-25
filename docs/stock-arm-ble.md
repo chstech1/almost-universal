@@ -6,7 +6,7 @@ The matched **Almost Universal handheld** profile has its own [package pins, TV 
 
 ## Associate the spare
 
-1. In **Settings → Devices & services → The Ununiversal Remote → Configure**, select the profile for the installed DSP candidate. Use **Stock ARM v4.8 · A-marker bench** for the exact ten-byte marker. Use **Stock ARM v4.8 · DSP key reports v1** for the two-screen key-report candidate.
+1. In **Settings → Devices & services → Almost Universal → Configure**, select the profile for the installed DSP candidate. Use **Stock ARM v4.8 · A-marker bench** for the exact ten-byte marker. Use **Stock ARM v4.8 · DSP key reports v1** for the two-screen key-report candidate.
 2. Enter the spare's Bluetooth address as shown by **Bluetooth → Advertisement monitor** in Home Assistant. From the same advertisement, enter the first six bytes of the manufacturer data for company ID `2409` (`0x0969`). Enter the bytes as twelve hex digits or as colon-separated pairs. The integration checks both values before connecting.
 3. Clear **Enable MQTT simulator transport** for the direct bench test. The integration subscribes through a Home Assistant adapter or an active ESPHome Bluetooth proxy and verifies the response to the stock v4.8 query before accepting any key notifications. [Home Assistant Bluetooth](https://www.home-assistant.io/integrations/bluetooth/) · [ESPHome Bluetooth proxy](https://esphome.io/components/bluetooth_proxy/)
 
@@ -34,8 +34,8 @@ The first command covers device association, the version query, rejected stock t
 From the repository root, package the complete integration directory. Exclude bytecode created by local tests.
 
 ```sh
-zip -r /tmp/ununiversal-remote-stock-v48.zip custom_components/ununiversal_remote -x '*/__pycache__/*' '*.pyc'
-shasum -a 256 /tmp/ununiversal-remote-stock-v48.zip
+zip -r /tmp/almost-universal-stock-v48.zip custom_components/ununiversal_remote -x '*/__pycache__/*' '*.pyc'
+shasum -a 256 /tmp/almost-universal-stock-v48.zip
 ```
 
 Project management can stage that archive against an isolated Home Assistant instance first. On the approved target, copy only the integration directory into the existing Home Assistant configuration and retain the existing config entry and storage. Restart Core to load version `0.1.2`, choose the stock profile under **Configure**, and use the disposable-switch procedure before assigning a real device. Keep the prior component directory available for rollback.

@@ -43,7 +43,7 @@ class RemoteConfigFlow(ConfigFlow, domain=DOMAIN):
                 if self.address:
                     data["ble_address"] = self.address
                 return self.async_create_entry(
-                    title="The Ununiversal Remote", data=data,
+                    title="Almost Universal", data=data,
                 )
             errors["remote_id"] = "invalid_remote_id"
         return self.async_show_form(

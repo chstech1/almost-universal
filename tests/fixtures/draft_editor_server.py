@@ -21,11 +21,11 @@ INDEX = """<!doctype html>
 <title>Remote Menus offline fixture</title>
 <script type="module" src="/ununiversal_remote/panel.js"></script>
 <style>body { margin: 0; background: #f2f3f0; }</style>
-<ununiversal-remote-panel></ununiversal-remote-panel>
+<almost-universal-panel></almost-universal-panel>
 <script type="module">
-  await customElements.whenDefined("ununiversal-remote-panel");
+  await customElements.whenDefined("almost-universal-panel");
   const states = await (await fetch("/fixture/states")).json();
-  document.querySelector("ununiversal-remote-panel").hass = {
+  document.querySelector("almost-universal-panel").hass = {
     states,
     async callWS(message) {
       const response = await fetch("/fixture/ws", {

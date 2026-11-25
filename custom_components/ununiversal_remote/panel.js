@@ -39,7 +39,7 @@ function select(options, value) {
   return control;
 }
 
-class UnuniversalRemotePanel extends HTMLElement {
+class AlmostUniversalPanel extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
@@ -310,8 +310,8 @@ class UnuniversalRemotePanel extends HTMLElement {
   }
 
   async mountHandheldDraft(configuration) {
-    await import("/ununiversal_remote/handheld-draft.js?v=0.1.6");
-    const draft = element("ununiversal-handheld-draft");
+    await import("/ununiversal_remote/handheld-draft.js?v=0.1.6-au");
+    const draft = element("almost-universal-handheld-draft");
     if (configuration) {
       draft.configureMatched(
         configuration,
@@ -343,9 +343,9 @@ class UnuniversalRemotePanel extends HTMLElement {
     status.textContent = "Loading draft…";
     try {
       const [{ MenuBuilder }, saved] = await Promise.all([
-        import("/ununiversal_remote/menu-builder.js?v=0.1.6"), this.call("draft_get"),
+        import("/ununiversal_remote/menu-builder.js?v=0.1.6-au"), this.call("draft_get"),
       ]);
-      const element_ = element("ununiversal-handheld-draft");
+      const element_ = element("almost-universal-handheld-draft");
       element_.portable = new MenuBuilder(element_, (action, data) => this.call(action, data), () => this.ha.states, saved);
       workspace.replaceChildren(element_);
       status.textContent = "";
@@ -693,4 +693,4 @@ function bindingName(binding, key) {
   return binding.label || NAMES[key];
 }
 
-customElements.define("ununiversal-remote-panel", UnuniversalRemotePanel);
+customElements.define("almost-universal-panel", AlmostUniversalPanel);

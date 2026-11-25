@@ -1,4 +1,4 @@
-# The Ununiversal Remote
+# Almost Universal
 
 **Making the SwitchBot Universal Remote live up to its name.**
 
@@ -32,7 +32,7 @@ On macOS, run `python worws_ota.py scan --normal` to find a running remote or `p
 
 ## Build menus in Home Assistant
 
-Copy `custom_components/ununiversal_remote` into your Home Assistant config directory under `custom_components` and restart Home Assistant. Add **The Ununiversal Remote** under **Settings → Devices & services → Add integration**, then open **Remote Menus** in the sidebar. Use **Fixed bindings** for the stock-ARM bench profiles. **Menu builder** saves, imports, exports, and previews draft layouts in Home Assistant. Pushing those drafts to the stock-ARM handset remains in development.
+Copy `custom_components/ununiversal_remote` into your Home Assistant config directory under `custom_components` and restart Home Assistant. Add **Almost Universal** under **Settings → Devices & services → Add integration**, then open **Remote Menus** in the sidebar. Use **Fixed bindings** for the stock-ARM bench profiles. **Menu builder** saves, imports, exports, and previews draft layouts in Home Assistant. Pushing those drafts to the stock-ARM handset remains in development.
 
 Home Assistant can use an existing Bluetooth adapter or active proxy. For the stock v4.8 ARM bench setup, identify the spare and select a matching fixed profile. Bluetooth works independently of MQTT. [Stock handheld setup](docs/stock-handheld-ha.md)
 

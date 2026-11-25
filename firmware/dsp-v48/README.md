@@ -50,7 +50,7 @@ From the Switchbot workspace root, use Python 3.11, the Espressif `esp-x32/2507`
 
 ```sh
 menu_build=$(mktemp -d)
-menu_src=ununiversal-remote/firmware/dsp-v48
+menu_src=almost-universal/firmware/dsp-v48
 python3 -B "$menu_src/build.py" artifacts/universal-remote/WoRWS_freq_app_V48.zip \
   "$menu_build/menu.zip" --smoke \
   --tool-prefix "$HOME/Library/Arduino15/packages/esp32/tools/esp-x32/2507/bin/xtensa-esp32-elf"

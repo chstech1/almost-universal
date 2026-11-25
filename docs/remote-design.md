@@ -5,7 +5,7 @@ Home Assistant owns activities, menus, and button mappings. The replacement firm
 ## Set up the menu editor
 
 1. Copy the repo’s `custom_components/ununiversal_remote` folder into your Home Assistant config directory under `custom_components`, then restart Home Assistant.
-2. In **Settings → Devices & services**, add **The Ununiversal Remote**. Give your remote an ID such as `living_room`. Use this ID in the MQTT client too.
+2. In **Settings → Devices & services**, add **Almost Universal**. Give your remote an ID such as `living_room`. Use this ID in the MQTT client too.
 3. Open **Remote Menus** in the sidebar. **Home** displays **TV**, **Lights**, and **Temp** above soft keys A, B, and C. The fourth slot is blank. Each key opens its own activity screen, where soft key D shows **Back** and returns to Home. Device actions start unassigned.
 4. Try the draft in **Remote preview**, then save it. The preview follows navigation and shows the action that would run. Saved menus are kept in Home Assistant and restored on restart.
 
@@ -31,7 +31,7 @@ In Menu mode, the physical Back key restores the last screen and its focus. In T
 This section covers the replacement-ARM URM1 service. For a spare with stock ARM v4.8 and a DSP prototype, use the [Stock ARM BLE setup and deployment guide](stock-arm-ble.md).
 
 1. Let Home Assistant discover the powered handheld using its Bluetooth integration. Use an existing connectable adapter or an active ESPHome Bluetooth proxy in range. [Home Assistant Bluetooth](https://www.home-assistant.io/integrations/bluetooth/) · [ESPHome Bluetooth proxy](https://esphome.io/components/bluetooth_proxy/)
-2. Open the discovered **The Ununiversal Remote** integration. Optionally select a switch in **First switch** to start with a one-button Home menu. On an existing integration, choose the handheld from **Configure**. Keep **Bluetooth off** to continue with the MQTT simulator alone.
+2. Open the discovered **Almost Universal** integration. Optionally select a switch in **First switch** to start with a one-button Home menu. On an existing integration, choose the handheld from **Configure**. Keep **Bluetooth off** to continue with the MQTT simulator alone.
 3. In **Remote Menus**, edit the shortcuts or open **More physical keys** to bind hardware controls on a screen. Soft key D and the hard Back key are editable. **Export saved menu** downloads the exact handheld menu as `menu-<revision>.urm`. When connected, the integration synchronizes the saved menu automatically.
 
 For the first switch check on an existing installation, add a test screen or use an empty slot on an existing screen. Choose **Shortcut 1**, enter **Lights** as the label, set **Action** to **Toggle switch**, and pick a test switch. Choose **Press** under **Run action on**. Link the new screen from a free Home slot if needed, then save. Tap A once to toggle the light and a second time to restore it. Holding A and releasing it should produce one toggle in total. The preview simulates the result.
@@ -48,7 +48,7 @@ The service UUID is `13f70001-7e61-4c69-9a28-9d39a8d01001`. Replace `0001` with 
 
 ## MQTT and the simulator
 
-Configure the built-in MQTT integration first for live presses. If you add MQTT after setting up the remote, reload **The Ununiversal Remote** from Devices & services. The editor preview also works during a broker disconnect.
+Configure the built-in MQTT integration first for live presses. If you add MQTT after setting up the remote, reload **Almost Universal** from Devices & services. The editor preview also works during a broker disconnect.
 
 ```sh
 python -m pip install paho-mqtt

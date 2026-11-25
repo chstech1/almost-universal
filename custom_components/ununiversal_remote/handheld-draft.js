@@ -697,5 +697,5 @@
     }
   }
 
-  customElements.define("ununiversal-handheld-draft", HandheldMenuDraft);
+  customElements.define("almost-universal-handheld-draft", HandheldMenuDraft);
 })();

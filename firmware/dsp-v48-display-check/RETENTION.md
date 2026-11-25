@@ -24,7 +24,7 @@ The member ends at `0x6f928`, within the stock 112 erase sectors. Two offline bu
 
 ```sh
 wake_build=$(mktemp -d)
-python3 -B ununiversal-remote/firmware/dsp-v48-display-check/build.py \
+python3 -B almost-universal/firmware/dsp-v48-display-check/build.py \
   artifacts/universal-remote/WoRWS_freq_app_V48.zip "$wake_build/wake.zip" \
   --retention --smoke \
   --tool-prefix "$HOME/Library/Arduino15/packages/esp32/tools/esp-x32/2507/bin/xtensa-esp32-elf"
